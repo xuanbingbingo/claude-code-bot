@@ -32,8 +32,28 @@ if not BOT_TOKEN:
 MAX_TG_LEN = 4000
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
 
-_new_session = True
-_resume_session_id = None  # None=用 --continue，有值=用 --resume <id>
+def _last_session_id() -> str | None:
+    """从 history.jsonl 取 CLAUDE_CWD 目录下最新会话 ID"""
+    path = os.path.expanduser("~/.claude/history.jsonl")
+    last_sid = None
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    if d.get("project") == CLAUDE_CWD:
+                        last_sid = d.get("sessionId") or last_sid
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return last_sid
+
+_new_session = False
+_resume_session_id = _last_session_id()  # 启动时自动续上全局最新会话
 _whisper_model = None
 
 
@@ -136,14 +156,18 @@ async def run_claude(prompt: str) -> str:
     )
 
     chunks = []
-    try:
+
+    async def _read():
         async for line in proc.stdout:
-            text = line.decode("utf-8", errors="replace")
-            print(text, end="", flush=True)
-            chunks.append(text)
-        await asyncio.wait_for(proc.wait(), timeout=300)
+            chunks.append(line.decode("utf-8", errors="replace"))
+            print(chunks[-1], end="", flush=True)
+
+    try:
+        await asyncio.wait_for(_read(), timeout=300)
+        await proc.wait()
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()
         print("\n⏰ 执行超时")
         return "❌ 执行超时（超过5分钟）"
 
@@ -194,7 +218,12 @@ async def run_claude_with_image(image_path: str, caption: str) -> str:
         cwd=CLAUDE_CWD,
     )
 
-    stdout, _ = await proc.communicate(input=stdin_payload.encode())
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(input=stdin_payload.encode()), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return "❌ 执行超时（超过5分钟）"
     result_text = ""
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
