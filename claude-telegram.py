@@ -15,7 +15,20 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+# 自动加载脚本同目录的 .env 文件
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not BOT_TOKEN:
+    print("❌ 缺少 TELEGRAM_BOT_TOKEN，请在 .env 文件或环境变量中设置")
+    sys.exit(1)
 MAX_TG_LEN = 4000
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
 
@@ -95,7 +108,7 @@ def list_sessions(limit: int = 10) -> list[dict]:
 
 def _build_session_flags() -> list[str]:
     if _resume_session_id:
-        return ["--session-id", _resume_session_id]
+        return ["--resume", _resume_session_id]
     if not _new_session:
         return ["--continue"]
     return []
