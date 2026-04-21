@@ -172,7 +172,13 @@ async def run_claude(prompt: str) -> str:
         return "❌ 执行超时（超过5分钟）"
 
     print(f"\n{'─' * 60}")
-    return "".join(chunks).strip()
+    result = "".join(chunks).strip()
+
+    if "Request too large" in result or "max 32MB" in result:
+        _new_session = True  # 强制下次开新会话
+        return "❌ 该会话内容过大（超过 32MB API 限制），无法恢复。\n已自动切换为新会话模式，请重新发送消息。"
+
+    return result
 
 
 async def run_claude_with_image(image_path: str, caption: str) -> str:

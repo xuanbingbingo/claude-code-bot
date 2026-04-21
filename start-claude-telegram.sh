@@ -1,8 +1,12 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_FILE="$SCRIPT_DIR/claude-telegram.log"
+
 # 加载 .env（如果存在）
-if [ -f "$(dirname "$0")/.env" ]; then
+if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a
-    source "$(dirname "$0")/.env"
+    source "$SCRIPT_DIR/.env"
     set +a
 fi
-python3 "$(dirname "$0")/claude-telegram.py"
+
+python3 "$SCRIPT_DIR/claude-telegram.py" >> "$LOG_FILE" 2>&1
