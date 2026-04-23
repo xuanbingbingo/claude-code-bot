@@ -28,99 +28,7 @@
 
 ---
 
-## 渠道一：Telegram
-
-### 1. 创建 Telegram Bot
-
-1. 手机 / 桌面 Telegram 搜索 **@BotFather**，开始对话
-2. 发送 `/newbot`
-3. 按提示输入 bot 名字和 username（username 必须以 `bot` 结尾，例如 `my_claude_bot`）
-4. BotFather 回复一串 Token，形如：
-   ```
-   123456789:AAE...xyz
-   ```
-   **保存好，下一步要用**
-5. 在 BotFather 给你的链接里点击 **START**，或直接搜索你的 bot 并发送 `/start`，否则 bot 无法主动给你发消息
-
-### 2. 安装 Telegram 渠道依赖
-
-```bash
-pip install python-telegram-bot faster-whisper
-```
-
-如果需要代理（下见第 4 步）：
-
-```bash
-pip install "python-telegram-bot[socks]"
-```
-
-### 3. 配置 `.env`
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env`，**Telegram 渠道只需要填这两个**：
-
-```env
-TELEGRAM_BOT_TOKEN=123456789:AAE...xyz   # 第 1 步 BotFather 给的 Token
-CLAUDE_CWD=/Users/you/projects            # Claude 执行时的工作目录（绝对路径）
-```
-
-`CLAUDE_CWD` 是 Claude 启动后 `cwd`，Claude 读写文件都以这个目录为根。
-
-### 4. 代理配置（国内用户必看）
-
-Telegram 在国内需要代理。代码里写死了 `socks5://127.0.0.1:53542`（位于 `claude-telegram.py` 的 `main()` 函数）。
-
-- 如果你用 Clash / Shadowrocket 等，把 SOCKS5 端口改成它们的监听端口（Clash 默认 `7890` 是 HTTP，SOCKS5 通常另配一个端口）
-- 不需要代理的用户：把 `.proxy(proxy)` 这一行删掉或注释
-
-编辑方式：
-
-```bash
-vim claude-telegram.py   # 搜索 socks5://127.0.0.1:53542，改成你的
-```
-
-### 5. 启动
-
-```bash
-bash start-claude-telegram.sh
-```
-
-看到 `🤖 Claude Code Telegram Gateway 启动中...` 就成功了。
-
-日志路径：`./claude-telegram.log`。
-
-### 6. 测试
-
-在 Telegram 给你的 bot 发一条消息，比如：
-
-```
-你好
-```
-
-bot 会先回复 `⏳ 处理中...`，然后流式改写成 Claude 的回复。
-
-再试：
-
-- 发条语音 → 首次会下载 Whisper base 模型（约 150MB）
-- 发张图片（带文字说明）→ 多模态分析
-
-### 7. 命令
-
-在 Telegram 里直接输入：
-
-| 命令 | 说明 |
-|------|------|
-| `/start` | 显示帮助 |
-| `/sessions` | 列出最近 10 条历史会话 |
-| `/resume <编号>` | 切换到指定会话继续对话 |
-| `/new` | 下一条消息开启全新会话 |
-
----
-
-## 渠道二：飞书（Lark）
+## 渠道一：飞书（Lark）
 
 飞书渠道用 **长连接（WebSocket）** 模式，本地直接连飞书服务器，**不需要公网地址、nginx、SSH 隧道、ngrok**。
 
@@ -185,6 +93,10 @@ pip install httpx lark-oapi faster-whisper
 
 ### 9. 配置 `.env`
 
+```bash
+cp .env.example .env
+```
+
 编辑 `.env`，**飞书渠道填这三个**：
 
 ```env
@@ -194,6 +106,8 @@ FEISHU_VERIFY_TOKEN=                     # 长连接模式留空即可
 
 CLAUDE_CWD=/Users/you/projects           # Claude 执行时的工作目录
 ```
+
+`CLAUDE_CWD` 是 Claude 启动后 `cwd`，Claude 读写文件都以这个目录为根。
 
 > 长连接模式下 `FEISHU_VERIFY_TOKEN` 不校验，可以留空。
 
@@ -239,16 +153,108 @@ bash start-claude-feishu.sh
 
 ---
 
+## 渠道二：Telegram
+
+### 1. 创建 Telegram Bot
+
+1. 手机 / 桌面 Telegram 搜索 **@BotFather**，开始对话
+2. 发送 `/newbot`
+3. 按提示输入 bot 名字和 username（username 必须以 `bot` 结尾，例如 `my_claude_bot`）
+4. BotFather 回复一串 Token，形如：
+   ```
+   123456789:AAE...xyz
+   ```
+   **保存好，下一步要用**
+5. 在 BotFather 给你的链接里点击 **START**，或直接搜索你的 bot 并发送 `/start`，否则 bot 无法主动给你发消息
+
+### 2. 安装 Telegram 渠道依赖
+
+```bash
+pip install python-telegram-bot faster-whisper
+```
+
+如果需要代理（下见第 4 步）：
+
+```bash
+pip install "python-telegram-bot[socks]"
+```
+
+### 3. 配置 `.env`
+
+如果还没创建 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，**Telegram 渠道只需要填这两个**：
+
+```env
+TELEGRAM_BOT_TOKEN=123456789:AAE...xyz   # 第 1 步 BotFather 给的 Token
+CLAUDE_CWD=/Users/you/projects            # Claude 执行时的工作目录（绝对路径）
+```
+
+### 4. 代理配置（国内用户必看）
+
+Telegram 在国内需要代理。代码里写死了 `socks5://127.0.0.1:53542`（位于 `claude-telegram.py` 的 `main()` 函数）。
+
+- 如果你用 Clash / Shadowrocket 等，把 SOCKS5 端口改成它们的监听端口（Clash 默认 `7890` 是 HTTP，SOCKS5 通常另配一个端口）
+- 不需要代理的用户：把 `.proxy(proxy)` 这一行删掉或注释
+
+编辑方式：
+
+```bash
+vim claude-telegram.py   # 搜索 socks5://127.0.0.1:53542，改成你的
+```
+
+### 5. 启动
+
+```bash
+bash start-claude-telegram.sh
+```
+
+看到 `🤖 Claude Code Telegram Gateway 启动中...` 就成功了。
+
+日志路径：`./claude-telegram.log`。
+
+### 6. 测试
+
+在 Telegram 给你的 bot 发一条消息，比如：
+
+```
+你好
+```
+
+bot 会先回复 `⏳ 处理中...`，然后流式改写成 Claude 的回复。
+
+再试：
+
+- 发条语音 → 首次会下载 Whisper base 模型（约 150MB）
+- 发张图片（带文字说明）→ 多模态分析
+
+### 7. 命令
+
+在 Telegram 里直接输入：
+
+| 命令 | 说明 |
+|------|------|
+| `/start` | 显示帮助 |
+| `/sessions` | 列出最近 10 条历史会话 |
+| `/resume <编号>` | 切换到指定会话继续对话 |
+| `/new` | 下一条消息开启全新会话 |
+
+---
+
 ## 命令对照表
 
-| 命令 | Telegram | 飞书 |
+| 命令 | 飞书 | Telegram |
 |------|:--:|:--:|
 | `/start` | ✅ | ✅ |
 | `/sessions` | ✅ | ✅ |
 | `/resume <编号>` | ✅ | ✅ |
-| `/resume <sessionId>` | ❌ | ✅ |
-| `/resume <标题>` | ❌ | ✅ |
-| `/rename ...` | ❌ | ✅ |
+| `/resume <sessionId>` | ✅ | ❌ |
+| `/resume <标题>` | ✅ | ❌ |
+| `/rename ...` | ✅ | ❌ |
 | `/new` | ✅ | ✅ |
 
 > Telegram 渠道的命令集较精简，后续如有需要可迁移飞书的增强命令。
