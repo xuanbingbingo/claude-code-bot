@@ -26,8 +26,8 @@
 2. **Python 3.10+**（`python3 --version` 确认）
 3. **本仓库代码**
    ```bash
-   git clone https://github.com/xuanbingbingo/claude-gateway.git
-   cd claude-gateway
+   git clone https://github.com/xuanbingbingo/claude-code-bot.git
+   cd claude-code-bot
    ```
 
 ---
@@ -316,7 +316,7 @@ bot 会先回复 `⏳ 处理中...`，然后流式改写成 Claude 的回复。
 ## 目录结构
 
 ```
-claude-gateway/
+claude-code-bot/
 ├── claude_core.py              # 共享核心：会话管理、调 claude CLI、流式解析、Whisper
 ├── claude-telegram.py          # Telegram 渠道
 ├── claude-feishu.py            # 飞书渠道（长连接）
