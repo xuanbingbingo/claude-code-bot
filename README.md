@@ -7,8 +7,12 @@
 - **文字消息** → 直接发给 Claude Code 执行
 - **语音消息** → 本地 Whisper 转写后执行
 - **图片消息** → 多模态，支持附加文字说明
-- **会话管理** → 列表 / 切换 / 重命名 / 新建
+- **会话管理** → 列表 / 切换 / 重命名 / 新建，按当前工作目录过滤
 - **流式回复** → Claude 一边生成，一边更新手机上的消息（Telegram 用 edit_text，飞书用 interactive 卡片 PATCH）
+- **工作目录切换**（飞书） → `/cwd` 交互式导航，每个用户独立 cwd，切换后自动接续该目录最近会话
+- **运行控制**（飞书） → `/stop` 中断任务，`/model` 切模型，`/mode` 切权限模式（bypass / plan / default / accept）
+- **Subagent 透传**（飞书） → `/agents` 列出 Claude Code 自定义 subagent，`/agent <name> <任务>` 一键派发
+- **Skills 透传**（飞书） → 未注册的 `/xxx` 直接作为 prompt 传给 `claude` CLI，可直接用官方 skill
 
 两个渠道完全独立，可以只装一个、也可以两个都装。
 
@@ -138,10 +142,13 @@ bash start-claude-feishu.sh
 
 ### 12. 命令
 
+#### 会话
+
 | 命令 | 说明 |
 |------|------|
-| `/start` | 显示帮助 |
-| `/sessions` | 列出最近 10 条历史会话（带 sessionId 和标题） |
+| `/start` | 显示帮助和当前状态 |
+| `/status` | 查看当前 cwd / 模型 / 模式 / sessionId / 任务状态 |
+| `/sessions` | 列出当前工作目录下最近 10 条历史会话 |
 | `/resume <编号>` | 按 `/sessions` 里的编号切换 |
 | `/resume <sessionId>` | 按完整 sessionId 切换 |
 | `/resume <标题>` | 按 `/sessions` 显示的标题切换（精确匹配） |
@@ -149,7 +156,45 @@ bash start-claude-feishu.sh
 | `/rename <sessionId> <新名称>` | 重命名指定会话 |
 | `/new` | 下一条消息开启全新会话 |
 
-启动时会自动接续最近一条可用会话；如果该会话历史数据不兼容（API 400），第一次消息会自动回退新会话模式，你重发即可。
+启动时会自动接续当前工作目录下最近一条可用会话；如果该会话历史数据不兼容（API 400），第一次消息会自动回退新会话模式，你重发即可。
+
+#### 运行控制
+
+| 命令 | 说明 |
+|------|------|
+| `/stop` | 中断当前正在运行的 Claude 任务（新消息也会自动中断旧任务） |
+| `/model` | 查看当前模型 |
+| `/model opus \| sonnet \| haiku` | 切换模型（下一条消息生效） |
+| `/model default` | 重置为 Claude CLI 默认 |
+| `/mode` | 查看当前权限模式 |
+| `/mode bypass` | 跳过所有确认（默认，对应 `--dangerously-skip-permissions`） |
+| `/mode plan` | 只规划不执行（Plan 模式） |
+| `/mode default` | 每次工具调用需确认 |
+| `/mode accept` | 自动接受文件编辑 |
+
+#### 工作目录（每个用户独立）
+
+| 命令 | 说明 |
+|------|------|
+| `/cwd` | 查看当前目录 + 列出子目录（带编号） |
+| `/cwd <编号>` | 进入上一步列出的子目录 |
+| `/cwd ..` | 返回上级 |
+| `/cwd <相对/绝对/~路径>` | 跳到任意目录 |
+
+切换目录时会**自动接续该目录下最近的可用会话**；如果该目录还没有历史会话，则下一条消息开启新会话。
+
+#### Subagent
+
+| 命令 | 说明 |
+|------|------|
+| `/agents` | 列出可用 subagent（`~/.claude/agents` + 项目 `.claude/agents`） |
+| `/agents <关键词>` | 按名称或描述模糊过滤 |
+| `/agent <name>` | 查看指定 agent 的详情 |
+| `/agent <name> <任务描述>` | 让 Claude 调用该 subagent 完成任务 |
+
+#### Skills 透传
+
+未注册的 `/xxx` 命令会直接作为 prompt 传给 `claude` CLI，可以直接使用 Claude Code 官方 skill（如 `/commit`、`/review`、`/init` 等）。
 
 ---
 
@@ -250,12 +295,19 @@ bot 会先回复 `⏳ 处理中...`，然后流式改写成 Claude 的回复。
 | 命令 | 飞书 | Telegram |
 |------|:--:|:--:|
 | `/start` | ✅ | ✅ |
+| `/status` | ✅ | ❌ |
 | `/sessions` | ✅ | ✅ |
 | `/resume <编号>` | ✅ | ✅ |
 | `/resume <sessionId>` | ✅ | ❌ |
 | `/resume <标题>` | ✅ | ❌ |
 | `/rename ...` | ✅ | ❌ |
 | `/new` | ✅ | ✅ |
+| `/stop` | ✅ | ❌ |
+| `/model ...` | ✅ | ❌ |
+| `/mode ...` | ✅ | ❌ |
+| `/cwd ...` | ✅ | ❌ |
+| `/agents` / `/agent` | ✅ | ❌ |
+| 未注册 `/xxx` 透传给 Claude | ✅ | ❌ |
 
 > Telegram 渠道的命令集较精简，后续如有需要可迁移飞书的增强命令。
 

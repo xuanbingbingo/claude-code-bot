@@ -23,7 +23,7 @@ from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.core.enum import LogLevel
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 
-from claude_core import ClaudeSession, list_sessions, set_session_title, _session_file_exists, transcribe_audio
+from claude_core import ClaudeSession, list_sessions, set_session_title, _session_file_exists, transcribe_audio, list_agents
 
 # 加载 .env
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -268,6 +268,59 @@ def _run_async(coro):
 # ── 命令处理 ─────────────────────────────────────────────────
 
 
+_CWD_LIST_LIMIT = 30
+
+
+def _list_subdirs(cwd: str) -> list[str]:
+    try:
+        names = [
+            n for n in os.listdir(cwd)
+            if not n.startswith(".") and os.path.isdir(os.path.join(cwd, n))
+        ]
+    except Exception:
+        return []
+    names.sort(key=str.lower)
+    return names
+
+
+def _render_cwd_view(session) -> str:
+    subdirs = _list_subdirs(session.cwd)
+    session.last_cwd_listing = subdirs[:_CWD_LIST_LIMIT]
+
+    parent = os.path.dirname(session.cwd.rstrip("/"))
+    lines = [f"📁 当前目录\n{session.cwd}"]
+    if parent and parent != session.cwd:
+        lines.append(f"\n上级：{parent}（/cwd ..）")
+
+    if not subdirs:
+        lines.append("\n（无子目录）")
+    else:
+        lines.append("")
+        for i, name in enumerate(session.last_cwd_listing, 1):
+            lines.append(f"{i}. {name}/")
+        if len(subdirs) > _CWD_LIST_LIMIT:
+            lines.append(f"…还有 {len(subdirs) - _CWD_LIST_LIMIT} 个未显示，请用路径指定")
+
+    lines.append("\n用法：/cwd <编号> / /cwd .. / /cwd <路径>")
+    return "\n".join(lines)
+
+
+def _resolve_cwd_arg(session, arg: str) -> str | None:
+    if not arg:
+        return None
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(session.last_cwd_listing):
+            return os.path.join(session.cwd, session.last_cwd_listing[idx])
+        return None
+    if arg.startswith("~"):
+        return os.path.abspath(os.path.expanduser(arg))
+    if os.path.isabs(arg):
+        return os.path.abspath(arg)
+    # 相对路径（含 ..）→ 基于 session.cwd
+    return os.path.abspath(os.path.join(session.cwd, arg))
+
+
 def _handle_command(sender: str, text: str) -> bool:
     text = text.strip()
     if text.startswith("/new"):
@@ -276,9 +329,13 @@ def _handle_command(sender: str, text: str) -> bool:
         _send_message_sync(sender, "text", {"text": "🔄 下一条消息将开启全新对话"})
         return True
     elif text.startswith("/sessions"):
-        sessions = list_sessions(10)
+        session = _get_session(sender)
+        sessions = list_sessions(10, cwd=session.cwd)
         if not sessions:
-            _send_message_sync(sender, "text", {"text": "❌ 没有找到历史会话"})
+            _send_message_sync(
+                sender, "text",
+                {"text": f"❌ 没有找到历史会话\n📁 {session.cwd}"},
+            )
             return True
         lines = ["📋 最近会话（/resume <编号> 或 /resume <sessionId>）\n"]
         for i, s in enumerate(sessions, 1):
@@ -303,7 +360,7 @@ def _handle_command(sender: str, text: str) -> bool:
         session = _get_session(sender)
         if arg.isdigit():
             idx = int(arg) - 1
-            sessions = list_sessions(10)
+            sessions = list_sessions(10, cwd=session.cwd)
             if idx < 0 or idx >= len(sessions):
                 _send_message_sync(
                     sender, "text",
@@ -326,7 +383,7 @@ def _handle_command(sender: str, text: str) -> bool:
             )
         else:
             # 按标题/summary 匹配（在更大的池子里找）
-            pool = list_sessions(100)
+            pool = list_sessions(100, cwd=session.cwd)
             matches = [s for s in pool if (s["summary"] or "").strip() == arg]
             if not matches:
                 _send_message_sync(
@@ -391,21 +448,196 @@ def _handle_command(sender: str, text: str) -> bool:
                 {"text": f"❌ 重命名失败（未找到 session 文件）：{sid}"},
             )
         return True
+    elif text.startswith("/cwd"):
+        parts = text.split(maxsplit=1)
+        session = _get_session(sender)
+        if len(parts) < 2:
+            _send_message_sync(sender, "text", {"text": _render_cwd_view(session)})
+            return True
+
+        arg = parts[1].strip()
+        target = _resolve_cwd_arg(session, arg)
+        if target is None:
+            _send_message_sync(
+                sender, "text",
+                {"text": f"❌ 无法解析：{arg}\n/cwd 查看当前目录和可选子目录"},
+            )
+            return True
+        if not os.path.isdir(target):
+            _send_message_sync(
+                sender, "text",
+                {"text": f"❌ 目录不存在：{target}"},
+            )
+            return True
+
+        session.set_cwd(target)
+        if session.current_session_id:
+            pool = list_sessions(1, cwd=target)
+            summary = pool[0]["summary"] if pool else ""
+            tip = (
+                f"已自动接续最近会话\n🔖 {session.current_session_id}"
+                + (f"\n📝 {summary}" if summary else "")
+            )
+        else:
+            tip = "该目录暂无历史会话，下一条消息将开启全新会话"
+
+        _send_message_sync(
+            sender, "text",
+            {"text": f"✅ 已切换工作目录\n{tip}\n\n{_render_cwd_view(session)}"},
+        )
+        return True
+    elif text.startswith("/stop"):
+        session = _get_session(sender)
+        # stop 是 async，在后台跑
+        async def _do_stop():
+            killed = await session.stop()
+            await asyncio.to_thread(
+                _send_message_sync, sender, "text",
+                {"text": "🛑 已中断当前任务" if killed else "ℹ️ 当前没有运行中的任务"},
+            )
+        _run_async(_do_stop())
+        return True
+    elif text.startswith("/status"):
+        session = _get_session(sender)
+        running = session.current_proc is not None and session.current_proc.returncode is None
+        lines = [
+            "📊 当前状态",
+            f"📁 目录：{session.cwd}",
+            f"🤖 模型：{session.model or '默认'}",
+            f"🔐 模式：{session.mode}",
+            f"🔖 会话：{session.current_session_id or '（新会话）'}",
+            f"⚙️ 任务：{'运行中' if running else '空闲'}",
+        ]
+        _send_message_sync(sender, "text", {"text": "\n".join(lines)})
+        return True
+    elif text.startswith("/model"):
+        parts = text.split(maxsplit=1)
+        session = _get_session(sender)
+        if len(parts) < 2:
+            _send_message_sync(
+                sender, "text",
+                {"text": f"🤖 当前模型：{session.model or '默认'}\n\n"
+                         f"切换：/model opus|sonnet|haiku|<完整ID>\n"
+                         f"重置：/model default"},
+            )
+            return True
+        name = parts[1].strip()
+        if name.lower() in ("default", "reset", "clear", "清除", "默认"):
+            session.set_model(None)
+            _send_message_sync(sender, "text", {"text": "✅ 已重置为 Claude CLI 默认模型"})
+        else:
+            session.set_model(name)
+            _send_message_sync(sender, "text", {"text": f"✅ 已切换模型：{name}\n下一条消息生效"})
+        return True
+    elif text.startswith("/mode"):
+        parts = text.split(maxsplit=1)
+        session = _get_session(sender)
+        if len(parts) < 2:
+            _send_message_sync(
+                sender, "text",
+                {"text": f"🔐 当前权限模式：{session.mode}\n\n"
+                         f"可选：bypass（跳过所有确认）/ plan（只规划不执行）/ default（每次确认）/ accept（自动接受文件编辑）\n"
+                         f"切换：/mode <名称>"},
+            )
+            return True
+        name = parts[1].strip().lower()
+        if session.set_mode(name):
+            _send_message_sync(sender, "text", {"text": f"✅ 已切换权限模式：{name}\n下一条消息生效"})
+        else:
+            _send_message_sync(
+                sender, "text",
+                {"text": f"❌ 未知模式：{name}\n可选：bypass / plan / default / accept"},
+            )
+        return True
+    elif text.startswith("/agents"):
+        session = _get_session(sender)
+        parts = text.split(maxsplit=1)
+        keyword = parts[1].strip().lower() if len(parts) > 1 else ""
+        agents = list_agents(cwd=session.cwd)
+        if keyword:
+            agents = [a for a in agents if keyword in a["name"].lower() or keyword in a["description"].lower()]
+        if not agents:
+            _send_message_sync(
+                sender, "text",
+                {"text": "❌ 未找到可用 agent\n" + (f"关键词：{keyword}" if keyword else f"已扫描：~/.claude/agents 和 {session.cwd}/.claude/agents")},
+            )
+            return True
+        lines = [f"🤖 可用 Agent ({len(agents)} 个)" + (f" · 关键词「{keyword}」" if keyword else "")]
+        for a in agents:
+            icon = "📂" if a["scope"] == "project" else "🌍"
+            model_tag = f" [{a['model']}]" if a.get("model") else ""
+            desc = a["description"][:80]
+            if len(a["description"]) > 80:
+                desc += "…"
+            lines.append(f"\n{icon} {a['name']}{model_tag}\n   {desc}")
+        lines.append("\n调用：/agent <name> <任务描述>")
+        _send_message_sync(sender, "text", {"text": "\n".join(lines)})
+        return True
+    elif text.startswith("/agent"):
+        session = _get_session(sender)
+        parts = text.split(maxsplit=2)
+        if len(parts) < 2:
+            _send_message_sync(
+                sender, "text",
+                {"text": "用法：\n/agent <name> — 查看 agent 详情\n/agent <name> <任务描述> — 调用 agent 执行任务\n\n先用 /agents 查看可用列表"},
+            )
+            return True
+        name = parts[1].strip()
+        agents = list_agents(cwd=session.cwd)
+        match = next((a for a in agents if a["name"] == name), None)
+        if not match:
+            _send_message_sync(
+                sender, "text",
+                {"text": f"❌ 未找到 agent：{name}\n用 /agents 查看列表"},
+            )
+            return True
+        if len(parts) < 3:
+            icon = "📂 项目" if match["scope"] == "project" else "🌍 全局"
+            model_tag = f"\n🧠 模型：{match['model']}" if match.get("model") else ""
+            _send_message_sync(
+                sender, "text",
+                {"text": f"🤖 {match['name']}\n{icon}{model_tag}\n\n{match['description']}\n\n调用：/agent {match['name']} <任务描述>"},
+            )
+            return True
+        task_desc = parts[2].strip()
+        # 把指令改写成让 Claude 主循环通过 Task 工具派发给该 subagent
+        rewritten = (
+            f'请调用 subagent "{match["name"]}" 完成以下任务，并把它的结果原样返回：\n\n'
+            f'{task_desc}'
+        )
+        _run_async(_handle_text_message(sender, rewritten))
+        return True
     elif text.startswith("/start"):
+        session = _get_session(sender)
         _send_message_sync(
             sender,
             "text",
             {
                 "text": (
                     "🤖 Claude Code Gateway 已就绪\n\n"
+                    f"📁 目录：{session.cwd}\n"
+                    f"🤖 模型：{session.model or '默认'}\n"
+                    f"🔐 模式：{session.mode}\n\n"
                     "支持：文字 / 图片 / 语音\n\n"
-                    "命令：\n"
-                    "/sessions — 查看历史会话列表\n"
-                    "/resume <编号|sessionId> — 切换到指定会话\n"
-                    "/rename <新名称> — 重命名当前会话\n"
-                    "/rename <sessionId> <新名称> — 重命名指定会话\n"
-                    "/new — 开启全新会话\n\n"
-                    "默认启动时自动接续最近一次会话"
+                    "会话：\n"
+                    "/sessions — 查看历史会话\n"
+                    "/resume <编号|sessionId|标题> — 切换会话\n"
+                    "/rename [<sessionId>] <新名称> — 重命名\n"
+                    "/new — 开启全新会话\n"
+                    "/status — 查看当前状态\n\n"
+                    "运行：\n"
+                    "/stop — 中断当前任务（新消息会自动中断）\n"
+                    "/model [opus|sonnet|haiku|default] — 切换模型\n"
+                    "/mode [bypass|plan|default|accept] — 切换权限模式\n\n"
+                    "目录：\n"
+                    "/cwd — 查看当前目录 + 子目录列表\n"
+                    "/cwd <编号|..|路径> — 切换目录\n\n"
+                    "Agent：\n"
+                    "/agents [关键词] — 列出可用 subagent\n"
+                    "/agent <name> — 查看 agent 详情\n"
+                    "/agent <name> <任务> — 调用 agent 执行\n\n"
+                    "其他未注册的 /xxx 会直接透传给 Claude CLI\n"
+                    "（如 /commit、/review 等官方 skill）"
                 )
             },
         )

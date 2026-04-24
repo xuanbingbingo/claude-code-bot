@@ -68,8 +68,9 @@ def set_session_title(sid: str, title: str) -> bool:
         return False
 
 
-def _last_session_id() -> str | None:
-    """从 history.jsonl 取 CLAUDE_CWD 目录下最新且仍存在的会话 ID"""
+def _last_session_id(cwd: str | None = None) -> str | None:
+    """从 history.jsonl 取指定目录（默认 CLAUDE_CWD）下最新且仍存在的会话 ID"""
+    target = cwd or CLAUDE_CWD
     path = os.path.expanduser("~/.claude/history.jsonl")
     candidates: list[str] = []
     try:
@@ -80,7 +81,7 @@ def _last_session_id() -> str | None:
                     continue
                 try:
                     d = json.loads(line)
-                    if d.get("project") == CLAUDE_CWD:
+                    if d.get("project") == target:
                         sid = d.get("sessionId")
                         if sid:
                             candidates.append(sid)
@@ -93,6 +94,81 @@ def _last_session_id() -> str | None:
         if _session_file_exists(sid):
             return sid
     return None
+
+
+def _parse_agent_frontmatter(path: str) -> dict | None:
+    """从 agent 的 markdown 文件读取 YAML frontmatter。支持 |/> 块标量。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+    if not lines or lines[0].strip() != "---":
+        return None
+
+    meta: dict[str, str] = {}
+    i = 1
+    while i < len(lines):
+        s = lines[i].rstrip("\n")
+        if s.strip() == "---":
+            break
+        if ":" not in s or s.startswith(" "):
+            i += 1
+            continue
+        key, _, val = s.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if val in ("|", ">"):
+            # 读后续缩进行作为块标量
+            block: list[str] = []
+            i += 1
+            while i < len(lines):
+                t = lines[i].rstrip("\n")
+                if t.strip() == "---":
+                    break
+                if t and not t.startswith((" ", "\t")):
+                    break
+                block.append(t.strip())
+                i += 1
+            # 合并成单行（去掉空行间隔）
+            meta[key] = " ".join(x for x in block if x)
+            continue
+        meta[key] = val.strip("'\"")
+        i += 1
+
+    if not meta.get("name"):
+        return None
+    return meta
+
+
+def list_agents(cwd: str | None = None) -> list[dict]:
+    """扫描全局 + 项目级 agent 目录，返回 [{name, description, scope, model, path}, ...]。
+    scope='project' 优先于 'user'，同名以 project 覆盖。
+    """
+    target_cwd = cwd or CLAUDE_CWD
+    result: dict[str, dict] = {}
+    sources = [
+        ("user", os.path.expanduser("~/.claude/agents")),
+        ("project", os.path.join(target_cwd, ".claude", "agents")),
+    ]
+    for scope, base in sources:
+        if not os.path.isdir(base):
+            continue
+        for fname in sorted(os.listdir(base)):
+            if not fname.endswith(".md"):
+                continue
+            path = os.path.join(base, fname)
+            meta = _parse_agent_frontmatter(path)
+            if not meta:
+                continue
+            result[meta["name"]] = {
+                "name": meta["name"],
+                "description": meta.get("description", ""),
+                "model": meta.get("model", ""),
+                "scope": scope,
+                "path": path,
+            }
+    return sorted(result.values(), key=lambda a: (a["scope"] != "project", a["name"].lower()))
 
 
 def _load_custom_titles() -> dict[str, str]:
@@ -119,8 +195,9 @@ def _load_custom_titles() -> dict[str, str]:
     return titles
 
 
-def list_sessions(limit: int = 10) -> list[dict]:
-    """从 history.jsonl 读取最近会话，优先用 /rename 设置的名字"""
+def list_sessions(limit: int = 10, cwd: str | None = None) -> list[dict]:
+    """从 history.jsonl 读取指定目录（默认 CLAUDE_CWD）下的最近会话"""
+    target = cwd or CLAUDE_CWD
     history_path = os.path.expanduser("~/.claude/history.jsonl")
     first: dict[str, dict] = {}
     latest: dict[str, int] = {}
@@ -134,6 +211,8 @@ def list_sessions(limit: int = 10) -> list[dict]:
                     entry = json.loads(line)
                     sid = entry.get("sessionId")
                     if not sid:
+                        continue
+                    if entry.get("project") != target:
                         continue
                     ts = entry.get("timestamp", 0)
                     if sid not in first:
@@ -154,6 +233,7 @@ def list_sessions(limit: int = 10) -> list[dict]:
             "proj": first[sid].get("project", ""),
         }
         for sid in first
+        if _session_file_exists(sid)
     ]
     sessions.sort(key=lambda x: x["timestamp"], reverse=True)
     return sessions[:limit]
@@ -232,10 +312,22 @@ async def _dispatch_event(event: dict, streamer):
 class ClaudeSession:
     """每个用户/渠道独立的 Claude 会话状态管理"""
 
-    def __init__(self):
+    MODES = {
+        "bypass": "--dangerously-skip-permissions",
+        "plan": ("--permission-mode", "plan"),
+        "default": ("--permission-mode", "default"),
+        "accept": ("--permission-mode", "acceptEdits"),
+    }
+
+    def __init__(self, cwd: str | None = None):
+        self.cwd = cwd or CLAUDE_CWD
         self.new_session = False
-        self.resume_session_id = _last_session_id()
+        self.resume_session_id = _last_session_id(self.cwd)
         self.current_session_id: str | None = self.resume_session_id
+        self.last_cwd_listing: list[str] = []
+        self.model: str | None = None  # None = 用 Claude CLI 默认
+        self.mode: str = "bypass"
+        self.current_proc: asyncio.subprocess.Process | None = None
 
     def set_new_session(self):
         self.new_session = True
@@ -247,6 +339,15 @@ class ClaudeSession:
         self.new_session = False
         self.current_session_id = session_id
 
+    def set_cwd(self, new_cwd: str) -> None:
+        """切换工作目录，并自动接续新目录下最新会话（无则开新会话）"""
+        self.cwd = new_cwd
+        last = _last_session_id(self.cwd)
+        if last:
+            self.set_resume_session(last)
+        else:
+            self.set_new_session()
+
     def build_session_flags(self) -> list[str]:
         if self.resume_session_id:
             return ["--resume", self.resume_session_id]
@@ -254,15 +355,61 @@ class ClaudeSession:
             return ["--continue"]
         return []
 
+    def _build_cmd_prefix(self) -> list[str]:
+        """组合 mode + model，返回 `claude <mode-flag> [--model <x>]`。"""
+        cmd: list[str] = ["claude"]
+        mode_flag = self.MODES.get(self.mode, self.MODES["bypass"])
+        if isinstance(mode_flag, tuple):
+            cmd.extend(mode_flag)
+        else:
+            cmd.append(mode_flag)
+        if self.model:
+            cmd.extend(["--model", self.model])
+        return cmd
+
+    def set_model(self, name: str | None) -> None:
+        """设置模型别名（opus/sonnet/haiku）或完整 ID；None/空 → 清除。"""
+        self.model = (name or "").strip() or None
+
+    def set_mode(self, name: str) -> bool:
+        """切换权限模式，返回是否合法。"""
+        if name not in self.MODES:
+            return False
+        self.mode = name
+        return True
+
+    async def stop(self) -> bool:
+        """终止当前运行中的 Claude 子进程，返回是否实际杀掉了东西。"""
+        proc = self.current_proc
+        if proc is None or proc.returncode is not None:
+            return False
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return False
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        return True
+
     async def run_claude(self, prompt: str, streamer=None) -> str:
         print(f"\n{'─' * 60}")
         print(f"📱  {prompt}")
         print(f"{'─' * 60}\n")
         sys.stdout.flush()
 
+        await self.stop()
         session_flags = self.build_session_flags()
         cmd = (
-            ["claude", "--dangerously-skip-permissions"]
+            self._build_cmd_prefix()
             + session_flags
             + [
                 "--output-format", "stream-json",
@@ -279,8 +426,9 @@ class ClaudeSession:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=CLAUDE_CWD,
+            cwd=self.cwd,
         )
+        self.current_proc = proc
 
         result_text = ""
         raw_tail = ""
@@ -310,15 +458,19 @@ class ClaudeSession:
                         result_is_error = True
 
         try:
-            await asyncio.wait_for(_read(), timeout=300)
-            await proc.wait()
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            print("\n⏰ 执行超时")
-            if streamer:
-                await streamer.clear_status()
-            return "❌ 执行超时（超过5分钟）"
+            try:
+                await asyncio.wait_for(_read(), timeout=300)
+                await proc.wait()
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                print("\n⏰ 执行超时")
+                if streamer:
+                    await streamer.clear_status()
+                return "❌ 执行超时（超过5分钟）"
+        finally:
+            if self.current_proc is proc:
+                self.current_proc = None
 
         print(f"\n{'─' * 60}")
 
@@ -360,9 +512,10 @@ class ClaudeSession:
         }
         stdin_payload = json.dumps({"type": "user", "message": message}) + "\n"
 
+        await self.stop()
         session_flags = self.build_session_flags()
         cmd = (
-            ["claude", "--dangerously-skip-permissions"]
+            self._build_cmd_prefix()
             + session_flags
             + [
                 "-p",
@@ -380,8 +533,9 @@ class ClaudeSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=CLAUDE_CWD,
+            cwd=self.cwd,
         )
+        self.current_proc = proc
 
         result_text = ""
 
@@ -409,14 +563,18 @@ class ClaudeSession:
                     result_text = event.get("result", "") or result_text
 
         try:
-            await asyncio.wait_for(_stream(), timeout=300)
-            await proc.wait()
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            if streamer:
-                await streamer.clear_status()
-            return "❌ 执行超时（超过5分钟）"
+            try:
+                await asyncio.wait_for(_stream(), timeout=300)
+                await proc.wait()
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                if streamer:
+                    await streamer.clear_status()
+                return "❌ 执行超时（超过5分钟）"
+        finally:
+            if self.current_proc is proc:
+                self.current_proc = None
 
         print(f"\n{'─' * 60}")
         return (result_text or "").strip()
