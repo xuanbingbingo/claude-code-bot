@@ -256,13 +256,52 @@ def _get_session(open_id: str) -> ClaudeSession:
     return _sessions[open_id]
 
 
+# 全局后台 event loop：所有协程共用，避免 session 内 asyncio 对象（subprocess、
+# Future、StreamReader）在不同消息之间跨 loop 漂移导致
+# "got Future <Future pending> attached to a different loop"。
+_loop: asyncio.AbstractEventLoop | None = None
+_loop_thread: threading.Thread | None = None
+_loop_ready = threading.Event()
+_loop_lock = threading.Lock()
+
+
+def _start_background_loop():
+    """启动后台线程跑 forever loop。幂等，重复调用安全。"""
+    global _loop, _loop_thread
+
+    with _loop_lock:
+        if _loop is not None and _loop.is_running():
+            return
+
+        _loop_ready.clear()
+
+        def _runner():
+            global _loop
+            _loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_loop)
+            _loop_ready.set()
+            try:
+                _loop.run_forever()
+            finally:
+                _loop.close()
+
+        _loop_thread = threading.Thread(
+            target=_runner, daemon=True, name="feishu-bg-loop"
+        )
+        _loop_thread.start()
+        _loop_ready.wait()
+
+
 def _run_async(coro):
-    """在新事件循环中运行协程。"""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    """把协程投递到全局后台 loop，阻塞等待结果。
+
+    所有消息处理线程共用同一个 loop，session 内部的 asyncio 对象
+    （subprocess、Future、Lock 等）始终绑定在这个 loop 上，跨消息复用安全。
+    """
+    if _loop is None or not _loop.is_running():
+        _start_background_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result()
 
 
 # ── 命令处理 ─────────────────────────────────────────────────
@@ -849,6 +888,10 @@ def _handle_message_event(event: P2ImMessageReceiveV1):
 def main():
     print("🤖 Claude Code Feishu Gateway 启动中（长连接模式）...")
     print(f"   App ID: {FEISHU_APP_ID[:8]}...")
+
+    # 提前启动后台 loop，确保第一条消息进来时 loop 已就绪
+    _start_background_loop()
+    print("   后台 event loop 已就绪")
     print("   等待飞书消息...\n")
 
     handler = (
