@@ -48,7 +48,11 @@ def _find_session_file(sid: str) -> str | None:
 
 
 def set_session_title(sid: str, title: str) -> bool:
-    """给指定 session 追加一条 custom-title 记录；成功返回 True。"""
+    """给指定 session 追加一条 custom-title 记录；成功返回 True。
+
+    写入后会立即把 jsonl 的 mtime 还原为写入前的值——CLI /resume 列表
+    按 mtime 倒序，标题补丁不应该把老会话顶到列表最前面。
+    """
     if not sid or not title:
         return False
     path = _find_session_file(sid)
@@ -61,10 +65,113 @@ def set_session_title(sid: str, title: str) -> bool:
         "timestamp": int(time.time() * 1000),
     }
     try:
+        prev_atime = os.path.getatime(path)
+        prev_mtime = os.path.getmtime(path)
+    except Exception:
+        prev_atime = prev_mtime = None
+    try:
         with open(path, "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return True
     except Exception:
+        return False
+    if prev_mtime is not None:
+        try:
+            os.utime(path, (prev_atime, prev_mtime))
+        except Exception:
+            pass
+    return True
+
+
+def _has_custom_title(sid: str) -> bool:
+    """检查 session 的 jsonl 里是否已有 custom-title。"""
+    path = _find_session_file(sid)
+    if not path:
+        return False
+    try:
+        with open(path) as f:
+            for line in f:
+                if '"custom-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    if d.get("type") == "custom-title" and d.get("customTitle"):
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        return False
+    return False
+
+
+def ensure_session_title(sid: str, prompt: str) -> bool:
+    """如果 session 还没标题，用 prompt 首行前 30 字补一条 custom-title。
+
+    解决：飞书/Telegram 走 `claude --print` 时 CLI 不会自动生成 ai-title，
+    导致这些会话在 CLI /resume 列表里没有可读标题，用户认不出来。
+    """
+    if not sid or not prompt:
+        return False
+    if _has_custom_title(sid):
+        return False
+    title = prompt.strip().splitlines()[0][:30] if prompt.strip() else ""
+    if not title:
+        return False
+    return set_session_title(sid, title)
+
+
+# CLI 内置元命令（执行后会创建 sid 但不是真实对话），这些 prompt 不应污染 history.jsonl
+_META_SLASH_COMMANDS = {
+    "/exit", "/quit",
+    "/usage", "/cost", "/status",
+    "/help", "/clear", "/compact",
+    "/model", "/config", "/permissions",
+    "/login", "/logout",
+    "/init", "/resume", "/rewind",
+    "/agents", "/mcp",
+    "/review", "/security-review",
+    "/bug", "/release-notes",
+    "/ide", "/migrate-installer", "/doctor",
+    "/sessions", "/rename", "/cwd", "/stop", "/mode", "/agent", "/start", "/new",
+}
+
+
+def _is_meta_slash_command(prompt: str) -> bool:
+    """判断是否是不应记入会话索引的元命令（如 /usage、/exit）。"""
+    if not prompt:
+        return False
+    s = prompt.lstrip()
+    if not s.startswith("/"):
+        return False
+    head = s.split(None, 1)[0].lower()
+    return head in _META_SLASH_COMMANDS
+
+
+def append_history_entry(prompt: str, project: str, session_id: str,
+                         timestamp_ms: int | None = None) -> bool:
+    """把一条用户输入追加到 ~/.claude/history.jsonl。
+
+    CLI 的 /resume 列表和飞书的 list_sessions 都依赖这个文件做索引；
+    飞书走 subprocess 调起 claude 时不会自动写入，需要由网关补一行。
+    纯元命令（/usage、/exit 等）会被跳过，避免污染会话索引。
+    """
+    if not prompt or not session_id or not project:
+        return False
+    if _is_meta_slash_command(prompt):
+        return False
+    entry = {
+        "display": prompt[:200],
+        "pastedContents": {},
+        "timestamp": timestamp_ms if timestamp_ms is not None else int(time.time() * 1000),
+        "project": project,
+        "sessionId": session_id,
+    }
+    path = os.path.expanduser("~/.claude/history.jsonl")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        print(f"[WARN] append_history_entry failed: {e}")
         return False
 
 
@@ -196,11 +303,16 @@ def _load_custom_titles() -> dict[str, str]:
 
 
 def list_sessions(limit: int = 10, cwd: str | None = None) -> list[dict]:
-    """从 history.jsonl 读取指定目录（默认 CLAUDE_CWD）下的最近会话"""
+    """从 history.jsonl 读取指定目录（默认 CLAUDE_CWD）下的最近会话。
+
+    summary 选择优先级：customTitle > 第一条非斜杠命令的 display > 最早的 display。
+    避免飞书会话标题全显示成 /exit、/resume、/sessions 等命令字符串。
+    """
     target = cwd or CLAUDE_CWD
     history_path = os.path.expanduser("~/.claude/history.jsonl")
-    first: dict[str, dict] = {}
+    proj_of: dict[str, str] = {}
     latest: dict[str, int] = {}
+    displays: dict[str, list[tuple[int, str]]] = {}
     try:
         with open(history_path) as f:
             for line in f:
@@ -215,9 +327,9 @@ def list_sessions(limit: int = 10, cwd: str | None = None) -> list[dict]:
                     if entry.get("project") != target:
                         continue
                     ts = entry.get("timestamp", 0)
-                    if sid not in first:
-                        first[sid] = entry
-                    latest[sid] = ts
+                    proj_of.setdefault(sid, entry.get("project", ""))
+                    latest[sid] = max(latest.get(sid, 0), ts)
+                    displays.setdefault(sid, []).append((ts, entry.get("display", "")))
                 except Exception:
                     pass
     except Exception:
@@ -225,14 +337,23 @@ def list_sessions(limit: int = 10, cwd: str | None = None) -> list[dict]:
 
     custom_titles = _load_custom_titles()
 
+    def _pick_summary(sid: str) -> str:
+        if sid in custom_titles and custom_titles[sid]:
+            return custom_titles[sid][:60]
+        items = sorted(displays.get(sid, []), key=lambda x: x[0])
+        for _, d in items:
+            if d and not d.lstrip().startswith("/"):
+                return d[:60]
+        return (items[0][1] if items else "")[:60]
+
     sessions = [
         {
             "id": sid,
             "timestamp": latest[sid],
-            "summary": custom_titles.get(sid) or first[sid].get("display", "")[:60],
-            "proj": first[sid].get("project", ""),
+            "summary": _pick_summary(sid),
+            "proj": proj_of.get(sid, ""),
         }
-        for sid in first
+        for sid in proj_of
         if _session_file_exists(sid)
     ]
     sessions.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -436,6 +557,7 @@ class ClaudeSession:
 
         async def _read():
             nonlocal result_text, raw_tail, result_is_error
+            history_logged = False
             async for line in proc.stdout:
                 decoded = line.decode("utf-8", errors="replace")
                 raw_tail = (raw_tail + decoded)[-4096:]
@@ -451,6 +573,10 @@ class ClaudeSession:
                     sid = event.get("session_id")
                     if sid:
                         self.current_session_id = sid
+                        if not history_logged:
+                            append_history_entry(prompt, self.cwd, sid)
+                            ensure_session_title(sid, prompt)
+                            history_logged = True
                 await _dispatch_event(event, streamer)
                 if event.get("type") == "result":
                     result_text = event.get("result", "") or result_text
@@ -544,6 +670,7 @@ class ClaudeSession:
             proc.stdin.write(stdin_payload.encode())
             await proc.stdin.drain()
             proc.stdin.close()
+            history_logged = False
             async for line in proc.stdout:
                 decoded = line.decode("utf-8", errors="replace")
                 print(decoded, end="", flush=True)
@@ -558,6 +685,10 @@ class ClaudeSession:
                     sid = event.get("session_id")
                     if sid:
                         self.current_session_id = sid
+                        if not history_logged:
+                            append_history_entry(prompt_text, self.cwd, sid)
+                            ensure_session_title(sid, prompt_text)
+                            history_logged = True
                 await _dispatch_event(event, streamer)
                 if event.get("type") == "result":
                     result_text = event.get("result", "") or result_text
