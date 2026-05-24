@@ -8,3 +8,14 @@ build/
 .DS_Store
 claude-telegram.log
 claude-feishu.log
+
+# Python 虚拟环境(142MB,绝不入库)
+venv/
+.venv/
+
+# 所有 log 文件
+*.log
+
+# 备份/临时文件
+*.bak
+*.bak-*
