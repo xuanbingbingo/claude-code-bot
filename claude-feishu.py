@@ -84,13 +84,15 @@ def _send_message_sync(receive_id: str, msg_type: str, content: dict, receive_id
 
 
 def _build_card(text: str) -> dict:
-    """把纯文本包成飞书 interactive 卡片（可被 PATCH 更新）。"""
+    """飞书 interactive 卡片（可被 PATCH 更新）。
+    使用 markdown 组件渲染 GFM 表格 / 列表 / 代码块 / 加粗 / 链接（需飞书 7.6+）。
+    """
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "elements": [
             {
-                "tag": "div",
-                "text": {"tag": "plain_text", "content": text or " "},
+                "tag": "markdown",
+                "content": text or " ",
             }
         ],
     }
@@ -154,9 +156,27 @@ def _download_resource_sync(message_id: str, file_key: str, rtype: str, save_pat
 
 # ── 流式输出推送 ──────────────────────────────────────────────
 
+# 飞书卡片硬限 30 KB（含 JSON 包装+样式标签），扣 5 KB 余量做实际预算
+_CARD_BUDGET_BYTES = 25000
 
-class FeishuStreamer:
-    """把 Claude Code 的 stream-json 事件推送到飞书消息。"""
+
+def _byte_len(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+
+def _truncate_by_bytes(s: str, max_bytes: int) -> str:
+    """按 UTF-8 字节预算截断字符串，结尾加省略号。"""
+    if max_bytes <= 0:
+        return ""
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return s
+    cut = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return cut + "…"
+
+
+class FeishuStreamerV1:
+    """旧版（v1）—— 单变量 status 覆盖、2 秒节流。保留作 fallback。"""
 
     MAX_LEN = 3500
     THROTTLE = 2.0
@@ -245,6 +265,171 @@ class FeishuStreamer:
                 )
             return
         await self._do_edit()
+
+
+class FeishuStreamerV2:
+    """新版（v2）—— 步骤历史化 + 0.25s 节流 + 25KB 字节预算自适应折叠。
+
+    卡片布局：
+        📋 已完成 N 步
+        ✅ Read package.json
+        ✅ Edit src/foo.ts
+        ✅ Bash(npm test)
+
+        💬 <Claude 的文字输出>
+
+        🔄 当前：Bash(npm install)
+    """
+
+    BUDGET = _CARD_BUDGET_BYTES
+    THROTTLE = 0.25  # 飞书单条消息更新硬限 5 QPS（200ms），留 50ms 余量
+
+    def __init__(self, receive_id: str, message_id: str):
+        self.receive_id = receive_id
+        self.message_id = message_id
+        self.text = ""
+        self.steps: list[str] = []
+        self.current_status: str = ""
+        self.last_edit = 0.0
+        self.has_content = False
+        self.partial_mode = False
+        self._dirty = False
+        self._pending_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _is_archivable(status: str) -> bool:
+        # 思考类（💭）不归档，工具类（🔧）等其他状态归档
+        return bool(status) and not status.startswith("💭")
+
+    @staticmethod
+    def _strip_tool_prefix(s: str) -> str:
+        # set_status 传入的工具名形如 "🔧 Read(foo.ts)"，归档时去掉前缀（步骤区用 ✅ 代替）
+        return s.removeprefix("🔧 ").strip()
+
+    def _render_steps(self, skip: int = 0) -> str:
+        if not self.steps:
+            return ""
+        n = len(self.steps)
+        skip = max(0, min(skip, n))
+        kept = self.steps[skip:]
+        lines = [f"**📋 已完成 {n} 步**", ""]
+        if skip > 0:
+            lines.append(f"_…（前 {skip} 步已折叠）_")
+        for s in kept:
+            lines.append(f"- ✅ {self._strip_tool_prefix(s)}")
+        return "\n".join(lines)
+
+    def _assemble(self, steps_part: str, text_part: str, status_part: str) -> str:
+        sections = []
+        if steps_part:
+            sections.append(steps_part)
+        if text_part:
+            sections.append(text_part if text_part.startswith("💬") else f"💬 {text_part}")
+        if status_part:
+            sections.append(status_part)
+        return "\n\n".join(sections) if sections else "⏳ 处理中..."
+
+    def _compose(self) -> str:
+        text_part = self.text or ""
+        status_part = f"**🔄 {self.current_status}**" if self.current_status else ""
+
+        full = self._assemble(self._render_steps(), text_part, status_part)
+        if _byte_len(full) <= self.BUDGET:
+            return full
+
+        # 折叠步骤（每次丢更多前缀）
+        n = len(self.steps)
+        for ratio in (4, 2, 4 / 3, 1):
+            skip = max(1, int(n / ratio))
+            full = self._assemble(self._render_steps(skip=skip), text_part, status_part)
+            if _byte_len(full) <= self.BUDGET:
+                return full
+
+        # 全折掉步骤还超 → 截短 text
+        steps_part = self._render_steps(skip=n)
+        fixed = self._assemble(steps_part, "", status_part)
+        remaining = self.BUDGET - _byte_len(fixed) - 64
+        text_part = _truncate_by_bytes(text_part, max(0, remaining))
+        return self._assemble(steps_part, text_part, status_part)
+
+    async def _do_edit(self):
+        self._dirty = False
+        text = self._compose()
+        try:
+            await asyncio.to_thread(_update_card_sync, self.message_id, text)
+        except Exception:
+            pass
+        self.last_edit = time.monotonic()
+
+    async def _delayed_edit(self, delay: float):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._dirty:
+            await self._do_edit()
+
+    async def _schedule(self):
+        self._dirty = True
+        if self._pending_task and not self._pending_task.done():
+            return
+        elapsed = time.monotonic() - self.last_edit
+        if elapsed >= self.THROTTLE:
+            await self._do_edit()
+        else:
+            self._pending_task = asyncio.create_task(self._delayed_edit(self.THROTTLE - elapsed))
+
+    async def append(self, chunk: str):
+        if not chunk:
+            return
+        self.has_content = True
+        self.text += chunk
+        await self._schedule()
+
+    async def set_status(self, line: str):
+        if line == self.current_status:
+            return
+        if self._is_archivable(self.current_status):
+            self.steps.append(self.current_status)
+        self.current_status = line
+        await self._schedule()
+
+    async def clear_status(self):
+        if not self.current_status:
+            return
+        if self._is_archivable(self.current_status):
+            self.steps.append(self.current_status)
+        self.current_status = ""
+        await self._schedule()
+
+    async def finalize(self, fallback: str = ""):
+        if self._is_archivable(self.current_status):
+            self.steps.append(self.current_status)
+        self.current_status = ""
+        if self._pending_task and not self._pending_task.done():
+            self._pending_task.cancel()
+
+        if not self.has_content:
+            text = (fallback or "").strip() or "✅ 完成（无文字输出）"
+            self.text = text
+        await self._do_edit()
+
+
+def _make_streamer(receive_id: str, message_id: str):
+    """根据 FEISHU_STREAM_MODE 环境变量选择 streamer 实现。
+
+    取值：
+      - v2（默认）：步骤历史化 + 0.25s 节流 + 25KB 字节预算
+      - v1       ：旧实现（单变量覆盖 + 2s 节流），出问题回滚用
+    """
+    mode = os.environ.get("FEISHU_STREAM_MODE", "v2").strip().lower()
+    if mode == "v1":
+        return FeishuStreamerV1(receive_id, message_id)
+    return FeishuStreamerV2(receive_id, message_id)
+
+
+# 兼容老代码引用
+FeishuStreamer = FeishuStreamerV2
 
 
 # ── 会话管理 ─────────────────────────────────────────────────
@@ -695,7 +880,7 @@ async def _handle_text_message(sender: str, text: str):
     reply_id = result.get("data", {}).get("message_id", "")
 
     session = _get_session(sender)
-    streamer = FeishuStreamer(sender, reply_id) if reply_id else None
+    streamer = _make_streamer(sender, reply_id) if reply_id else None
 
     try:
         response = await session.run_claude(text, streamer)
@@ -741,7 +926,7 @@ async def _handle_image_message(sender: str, message_id: str, file_key: str, cap
         return
 
     session = _get_session(sender)
-    streamer = FeishuStreamer(sender, reply_id) if reply_id else None
+    streamer = _make_streamer(sender, reply_id) if reply_id else None
 
     prompt = caption.strip() or "请描述这张图片的内容"
     response = ""
@@ -816,7 +1001,7 @@ async def _handle_audio_message(sender: str, message_id: str, file_key: str):
         await asyncio.to_thread(_update_card_sync, reply_id, f"🎙️ 已识别：{text}\n\n⏳ 处理中...")
 
     session = _get_session(sender)
-    streamer = FeishuStreamer(sender, reply_id) if reply_id else None
+    streamer = _make_streamer(sender, reply_id) if reply_id else None
     # 让 streamer 的首次 append 不再被 partial_mode 吞；同时让头部继续显示识别结果
     if streamer:
         streamer.text = f"🎙️ 已识别：{text}\n\n"
