@@ -334,14 +334,19 @@ def main():
     print("   等待手机消息...\n")
 
     import httpx
-    proxy = "socks5://127.0.0.1:53542"
-    app = (
+    # 代理可配：设了 TELEGRAM_PROXY 就走显式代理，留空则直连（依赖系统 TUN 透明转发）
+    proxy = os.environ.get("TELEGRAM_PROXY", "").strip()
+    builder = (
         Application.builder()
         .token(BOT_TOKEN)
         .connect_timeout(30).read_timeout(30).write_timeout(30)
-        .proxy(proxy)
-        .build()
     )
+    if proxy:
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+        print(f"   代理: {proxy}")
+    else:
+        print("   代理: 直连（依赖系统 TUN）")
+    app = builder.build()
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("new", on_new))
     app.add_handler(CommandHandler("sessions", on_sessions))

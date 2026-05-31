@@ -9,4 +9,4 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     set +a
 fi
 
-python3 "$SCRIPT_DIR/claude-telegram.py" >> "$LOG_FILE" 2>&1
+"$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/claude-telegram.py" >> "$LOG_FILE" 2>&1

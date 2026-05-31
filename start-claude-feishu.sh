@@ -9,4 +9,4 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     set +a
 fi
 
-/Users/mac/aiProjects/claude-gateway/venv/bin/python "$SCRIPT_DIR/claude-feishu.py" >> "$LOG_FILE" 2>&1
+/Users/libin/aiProjects/claude-gateway/venv/bin/python "$SCRIPT_DIR/claude-feishu.py" >> "$LOG_FILE" 2>&1
