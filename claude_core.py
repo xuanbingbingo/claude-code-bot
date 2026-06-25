@@ -442,9 +442,11 @@ class ClaudeSession:
 
     def __init__(self, cwd: str | None = None):
         self.cwd = cwd or CLAUDE_CWD
-        self.new_session = False
-        self.resume_session_id = _last_session_id(self.cwd)
-        self.current_session_id: str | None = self.resume_session_id
+        # 默认开新会话：首条消息全新开，同一段对话内后续消息靠 --continue 自动接上。
+        # 如需接续旧会话，用 /resume <编号>。
+        self.new_session = True
+        self.resume_session_id = None
+        self.current_session_id: str | None = None
         self.last_cwd_listing: list[str] = []
         self.model: str | None = None  # None = 用 Claude CLI 默认
         self.mode: str = "bypass"
@@ -461,17 +463,21 @@ class ClaudeSession:
         self.current_session_id = session_id
 
     def set_cwd(self, new_cwd: str) -> None:
-        """切换工作目录，并自动接续新目录下最新会话（无则开新会话）"""
+        """切换工作目录，默认开新会话（要接旧会话用 /resume）"""
         self.cwd = new_cwd
-        last = _last_session_id(self.cwd)
-        if last:
-            self.set_resume_session(last)
-        else:
-            self.set_new_session()
+        self.set_new_session()
 
     def build_session_flags(self) -> list[str]:
         if self.resume_session_id:
             return ["--resume", self.resume_session_id]
+        # 钉死本网关自己那条会话：用 --resume <current_session_id>，
+        # 而不是 --continue。--continue 接的是「工作目录里最近活跃的会话」，
+        # 由于飞书网关与 CLI 共用同一个 cwd（~/aiProjects）的会话池，
+        # 在 CLI 聊过之后再发飞书，--continue 会串到 CLI 的会话上。
+        # 改为 --resume 自己的 session id 后，飞书永远只接它自己的线；
+        # 主动 /resume <编号> 仍走上面 resume_session_id 分支，可跳到任意 CLI 会话。
+        if not self.new_session and self.current_session_id:
+            return ["--resume", self.current_session_id]
         if not self.new_session:
             return ["--continue"]
         return []
