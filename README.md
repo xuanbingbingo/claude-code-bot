@@ -1,6 +1,8 @@
 # Claude Code Gateway
 
-用 Telegram 或飞书远程操控本地 Claude Code —— 手机上发消息、发图、发语音，本地 Claude 执行，回复实时流式推回到手机。
+用飞书远程操控本地 Claude Code —— 手机上发消息、发图、发语音，本地 Claude 执行，回复实时流式推回到手机。
+
+> **渠道说明**：目前仅维护 **飞书渠道**（功能完整）。Telegram 渠道代码保留但暂停维护，不建议新用户配置。
 
 ## 功能
 
@@ -198,7 +200,9 @@ bash start-claude-feishu.sh
 
 ---
 
-## 渠道二：Telegram
+## 渠道二：Telegram（暂停维护）
+
+> ⚠️ Telegram 渠道目前暂停维护，代码保留供参考，不建议新用户配置。
 
 ### 1. 创建 Telegram Bot
 

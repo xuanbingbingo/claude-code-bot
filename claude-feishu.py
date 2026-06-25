@@ -154,6 +154,73 @@ def _download_resource_sync(message_id: str, file_key: str, rtype: str, save_pat
     return False
 
 
+# ── 上传 / 发送本地文件到飞书 ─────────────────────────────────
+
+_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _upload_file_sync(file_path: str, file_type: str) -> str:
+    """上传本地文件到飞书，返回 file_key。file_type ∈ {mp4, opus, pdf, doc, xls, ppt, stream}。"""
+    token = _get_tenant_access_token()
+    fn = os.path.basename(file_path)
+    with open(file_path, "rb") as fh:
+        resp = httpx.post(
+            f"{FEISHU_BASE_URL}/im/v1/files",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_type": file_type, "file_name": fn},
+            files={"file": (fn, fh)},
+            timeout=300,
+        )
+    data = resp.json()
+    if data.get("code") != 0:
+        print(f"[WARN] upload file failed: {data}")
+        return ""
+    return (data.get("data") or {}).get("file_key", "")
+
+
+def _upload_image_sync(file_path: str) -> str:
+    """上传本地图片到飞书，返回 image_key。"""
+    token = _get_tenant_access_token()
+    fn = os.path.basename(file_path)
+    with open(file_path, "rb") as fh:
+        resp = httpx.post(
+            f"{FEISHU_BASE_URL}/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": (fn, fh)},
+            timeout=120,
+        )
+    data = resp.json()
+    if data.get("code") != 0:
+        print(f"[WARN] upload image failed: {data}")
+        return ""
+    return (data.get("data") or {}).get("image_key", "")
+
+
+def _send_local_file_sync(receive_id: str, file_path: str, receive_id_type: str = "open_id") -> dict:
+    """把本地文件发到飞书：视频→media，图片→image，其它→file。"""
+    if not os.path.isfile(file_path):
+        return {"code": -1, "msg": f"file not found: {file_path}"}
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in _IMAGE_EXTS:
+        image_key = _upload_image_sync(file_path)
+        if not image_key:
+            return {"code": -1, "msg": "upload image failed"}
+        return _send_message_sync(receive_id, "image", {"image_key": image_key}, receive_id_type)
+    if ext in _VIDEO_EXTS:
+        file_key = _upload_file_sync(file_path, "mp4")
+        if file_key:
+            res = _send_message_sync(receive_id, "media", {"file_key": file_key}, receive_id_type)
+            if res.get("code") == 0:
+                return res
+        # media 失败则回退为普通文件
+    file_key = _upload_file_sync(file_path, "stream")
+    if not file_key:
+        return {"code": -1, "msg": "upload file failed"}
+    return _send_message_sync(receive_id, "file", {"file_key": file_key}, receive_id_type)
+
+
 # ── 流式输出推送 ──────────────────────────────────────────────
 
 # 飞书卡片硬限 30 KB（含 JSON 包装+样式标签），扣 5 KB 余量做实际预算
@@ -956,6 +1023,62 @@ async def _handle_image_message(sender: str, message_id: str, file_key: str, cap
             )
 
 
+async def _handle_file_message(sender: str, message_id: str, file_key: str, file_name: str = ""):
+    if not file_key or not sender or not message_id:
+        return
+
+    result = await asyncio.to_thread(_send_card_sync, sender, "📎 处理文件中...")
+    reply_id = result.get("data", {}).get("message_id", "")
+
+    suffix = os.path.splitext(file_name)[1] if file_name else ""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+
+    # 如果有原始文件名，重命名临时文件让 Claude 能看到扩展名和名称
+    if file_name:
+        named_path = os.path.join(os.path.dirname(tmp_path), file_name)
+        os.rename(tmp_path, named_path)
+        tmp_path = named_path
+
+    downloaded = await asyncio.to_thread(
+        _download_resource_sync, message_id, file_key, "file", tmp_path
+    )
+    if not downloaded:
+        if reply_id:
+            await asyncio.to_thread(_update_card_sync, reply_id, "❌ 文件下载失败")
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        return
+
+    session = _get_session(sender)
+    streamer = _make_streamer(sender, reply_id) if reply_id else None
+
+    display_name = file_name or os.path.basename(tmp_path)
+    prompt = f"用户通过飞书发送了文件：{display_name}\n文件已保存到本地：{tmp_path}\n\n请根据文件内容和类型做出合适的处理（如读取、分析、总结等）。"
+
+    try:
+        response = await session.run_claude(prompt, streamer)
+    except Exception as e:
+        if streamer:
+            await streamer.finalize(fallback=f"❌ 出错了：{e}")
+        else:
+            await asyncio.to_thread(
+                _send_message_sync, sender, "text", {"text": f"❌ 出错了：{e}"}
+            )
+        return
+
+    if streamer:
+        await streamer.finalize(fallback=response)
+    else:
+        for i in range(0, len(response), MAX_MSG_LEN):
+            await asyncio.to_thread(
+                _send_message_sync, sender, "text",
+                {"text": response[i:i + MAX_MSG_LEN]},
+            )
+
+
 async def _handle_audio_message(sender: str, message_id: str, file_key: str):
     if not file_key or not sender or not message_id:
         return
@@ -1051,6 +1174,10 @@ def _process_message_event(event: P2ImMessageReceiveV1):
         elif msg_type == "audio":
             file_key = content.get("file_key", "")
             _run_async(_handle_audio_message(sender_id, message_id, file_key))
+        elif msg_type == "file":
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "")
+            _run_async(_handle_file_message(sender_id, message_id, file_key, file_name))
         else:
             print(f"[DEBUG] 暂不支持的消息类型: {msg_type}")
     except Exception as e:
