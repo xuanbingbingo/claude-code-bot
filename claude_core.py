@@ -451,6 +451,10 @@ class ClaudeSession:
         self.model: str | None = None  # None = 用 Claude CLI 默认
         self.mode: str = "bypass"
         self.current_proc: asyncio.subprocess.Process | None = None
+        # 注入到 claude 子进程环境的额外变量（在 os.environ 之上 merge）。
+        # 飞书/TG 网关用它把「当前会话发起人」标识传进去，供 feishu-send-file 等
+        # 工具实现「发到当前聊天窗口」。一个会话进程固定服务一个发起人，启动时设一次即可。
+        self.extra_env: dict[str, str] = {}
 
     def set_new_session(self):
         self.new_session = True
@@ -554,6 +558,7 @@ class ClaudeSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.cwd,
+            env={**os.environ, **self.extra_env},
         )
         self.current_proc = proc
 
@@ -666,6 +671,7 @@ class ClaudeSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.cwd,
+            env={**os.environ, **self.extra_env},
         )
         self.current_proc = proc
 

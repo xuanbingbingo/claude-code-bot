@@ -1,4 +1,7 @@
 .env
+# 各 bot 的私有凭证（.env.feishu2/.env.feishu3 等），绝不入库；保留 .env.example 模板
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.pyo
