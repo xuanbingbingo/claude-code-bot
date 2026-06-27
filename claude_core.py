@@ -455,6 +455,9 @@ class ClaudeSession:
         # 飞书/TG 网关用它把「当前会话发起人」标识传进去，供 feishu-send-file 等
         # 工具实现「发到当前聊天窗口」。一个会话进程固定服务一个发起人，启动时设一次即可。
         self.extra_env: dict[str, str] = {}
+        # 追加到 claude 的 system prompt（--append-system-prompt）。网关用它在不依赖
+        # 客户手写 CLAUDE.md 的情况下，告知 claude「有哪些渠道工具可用」，开箱即用。
+        self.extra_append_prompt: str = ""
 
     def set_new_session(self):
         self.new_session = True
@@ -496,6 +499,8 @@ class ClaudeSession:
             cmd.append(mode_flag)
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.extra_append_prompt:
+            cmd.extend(["--append-system-prompt", self.extra_append_prompt])
         return cmd
 
     def set_model(self, name: str | None) -> None:

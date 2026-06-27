@@ -154,73 +154,6 @@ def _download_resource_sync(message_id: str, file_key: str, rtype: str, save_pat
     return False
 
 
-# ── 上传 / 发送本地文件到飞书 ─────────────────────────────────
-
-_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-
-
-def _upload_file_sync(file_path: str, file_type: str) -> str:
-    """上传本地文件到飞书，返回 file_key。file_type ∈ {mp4, opus, pdf, doc, xls, ppt, stream}。"""
-    token = _get_tenant_access_token()
-    fn = os.path.basename(file_path)
-    with open(file_path, "rb") as fh:
-        resp = httpx.post(
-            f"{FEISHU_BASE_URL}/im/v1/files",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"file_type": file_type, "file_name": fn},
-            files={"file": (fn, fh)},
-            timeout=300,
-        )
-    data = resp.json()
-    if data.get("code") != 0:
-        print(f"[WARN] upload file failed: {data}")
-        return ""
-    return (data.get("data") or {}).get("file_key", "")
-
-
-def _upload_image_sync(file_path: str) -> str:
-    """上传本地图片到飞书，返回 image_key。"""
-    token = _get_tenant_access_token()
-    fn = os.path.basename(file_path)
-    with open(file_path, "rb") as fh:
-        resp = httpx.post(
-            f"{FEISHU_BASE_URL}/im/v1/images",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"image_type": "message"},
-            files={"image": (fn, fh)},
-            timeout=120,
-        )
-    data = resp.json()
-    if data.get("code") != 0:
-        print(f"[WARN] upload image failed: {data}")
-        return ""
-    return (data.get("data") or {}).get("image_key", "")
-
-
-def _send_local_file_sync(receive_id: str, file_path: str, receive_id_type: str = "open_id") -> dict:
-    """把本地文件发到飞书：视频→media，图片→image，其它→file。"""
-    if not os.path.isfile(file_path):
-        return {"code": -1, "msg": f"file not found: {file_path}"}
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext in _IMAGE_EXTS:
-        image_key = _upload_image_sync(file_path)
-        if not image_key:
-            return {"code": -1, "msg": "upload image failed"}
-        return _send_message_sync(receive_id, "image", {"image_key": image_key}, receive_id_type)
-    if ext in _VIDEO_EXTS:
-        file_key = _upload_file_sync(file_path, "mp4")
-        if file_key:
-            res = _send_message_sync(receive_id, "media", {"file_key": file_key}, receive_id_type)
-            if res.get("code") == 0:
-                return res
-        # media 失败则回退为普通文件
-    file_key = _upload_file_sync(file_path, "stream")
-    if not file_key:
-        return {"code": -1, "msg": "upload file failed"}
-    return _send_message_sync(receive_id, "file", {"file_key": file_key}, receive_id_type)
-
-
 # ── 流式输出推送 ──────────────────────────────────────────────
 
 # 飞书卡片硬限 30 KB（含 JSON 包装+样式标签），扣 5 KB 余量做实际预算
@@ -502,6 +435,21 @@ FeishuStreamer = FeishuStreamerV2
 # ── 会话管理 ─────────────────────────────────────────────────
 
 
+# 仓库内自带的发文件工具（路径相对本文件推导，不写死任何用户绝对路径）。
+_SEND_FILE_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "tools", "feishu-send-file.py")
+# 注入 claude system prompt：让它知道有这个工具，用户要发文件时主动调用——
+# 客户零配置，无需自己写 CLAUDE.md。
+_FEISHU_SEND_PROMPT = (
+    "你运行在飞书机器人网关里，正在和用户在飞书聊天窗对话。\n"
+    "当用户要求把某个本地文件 / 图片 / 视频发到飞书（例如「发我」「发到聊天框」"
+    "「把这个视频发我手机」「发我手机上」），直接执行：\n"
+    f"    python3 {_SEND_FILE_TOOL} <文件绝对路径>\n"
+    "不传收件人时，工具会自动发到「当前对话窗口」（网关已注入发起人 open_id 与当前 bot 凭证）。\n"
+    "图片→image、视频→media、其它→file；视频超 28MB 会自动压缩。仅在用户明确要发文件时才调用。"
+)
+
+
 def _get_session(open_id: str) -> ClaudeSession:
     if open_id not in _sessions:
         _sessions[open_id] = ClaudeSession()
@@ -516,6 +464,8 @@ def _get_session(open_id: str) -> ClaudeSession:
             sess.extra_env["FEISHU_APP_ID"] = FEISHU_APP_ID
         if FEISHU_APP_SECRET:
             sess.extra_env["FEISHU_APP_SECRET"] = FEISHU_APP_SECRET
+    if os.path.isfile(_SEND_FILE_TOOL):
+        sess.extra_append_prompt = _FEISHU_SEND_PROMPT
     return sess
 
 
