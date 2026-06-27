@@ -1,0 +1,12 @@
+# feishu-send-file 兜底配置（可选）
+# 实际路径：~/.claude/tools/feishu-send-file.conf —— 复制本文件过去并改值即可。
+#
+# 仅在「命令行未传 receive_id 且 网关也没注入 FEISHU_SENDER_OPEN_ID」时才用到。
+# 网关正常运行时，发到「当前聊天窗」靠注入的 open_id 自动成立，不需要本文件。
+
+# 兜底默认收件人（某个 open_id，按你 bot app 隔离的口径）
+DEFAULT_RECEIVE_ID=
+RECEIVE_ID_TYPE=open_id
+
+# 凭证兜底：当环境变量里没有 FEISHU_APP_ID/SECRET 时，从这个 .env 反查
+GATEWAY_ENV=~/aiProjects/claude-gateway/.env

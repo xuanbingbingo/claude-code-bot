@@ -371,6 +371,33 @@ Whisper `base` 模型首次使用会下载 ~150MB，之后常驻内存。下载�
 
 ---
 
+## 发文件 / 视频到当前飞书聊天窗
+
+网关在 spawn claude 子进程时，会把**当前会话发起人 open_id**（`FEISHU_SENDER_OPEN_ID`）和**当前 bot 凭证**（`FEISHU_APP_ID/SECRET`）注入子进程环境。配合仓库内自包含工具 `tools/feishu-send-file.py`，就能把本地文件回发到「正在对话的这个聊天窗」。
+
+**手动验证**（在网关机器上任意终端）：
+
+```bash
+# 发给指定 open_id（图片→image，视频→media，其它→file；视频>28MB 自动 ffmpeg 压缩）
+python3 tools/feishu-send-file.py /path/to/video.mp4 ou_xxxxxxxx
+```
+
+**让 Claude 自动发**：网关跑的是 `claude` CLI，它默认**不知道**有这个工具。要让你在飞书里说"把这个视频发我"时它真去发，需要在 `CLAUDE_CWD`（默认 `~/aiProjects`）下放一份 `CLAUDE.md`，加上这段指令：
+
+```markdown
+## 发文件到当前飞书聊天窗
+用户在飞书里说"发我/发到聊天框/发这个文件/发视频"时，直接执行：
+    python3 ~/aiProjects/claude-gateway/tools/feishu-send-file.py <文件绝对路径>
+不传 receive_id 时，工具自动用网关注入的 FEISHU_SENDER_OPEN_ID（即当前对话窗口）。
+```
+
+**收件人解析优先级**：命令行第二参 > 环境变量 `FEISHU_SENDER_OPEN_ID`（网关注入＝当前窗口）> `~/.claude/tools/feishu-send-file.conf` 的 `DEFAULT_RECEIVE_ID`（兜底，见 `tools/feishu-send-file.conf.example`）。
+**凭证解析优先级**：环境变量（当前 bot）> `FEISHU_SEND_ENV` > conf 的 `GATEWAY_ENV` > `~/aiProjects/claude-gateway/.env`。
+
+> ⚠️ 飞书单文件硬上限 30MB，视频建议装 `ffmpeg`（缺失时工具优雅降级：不压缩、不生成封面，仍尝试原样发送）。
+
+---
+
 ## 注意事项
 
 - **凭证保护**：`.env` 已在 `.gitignore`，任何情况下不要把 Token / Secret 提交到仓库

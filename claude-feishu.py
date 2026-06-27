@@ -505,7 +505,18 @@ FeishuStreamer = FeishuStreamerV2
 def _get_session(open_id: str) -> ClaudeSession:
     if open_id not in _sessions:
         _sessions[open_id] = ClaudeSession()
-    return _sessions[open_id]
+    sess = _sessions[open_id]
+    # 把「当前会话发起人」身份 + 当前 bot 凭证注入 claude 子进程环境，
+    # 供仓库内 tools/feishu-send-file.py 实现「发文件到当前飞书聊天窗」。
+    # 一个 session 固定服务一个 open_id，每次取用时刷一遍幂等，开销可忽略。
+    if open_id:
+        sess.extra_env["FEISHU_SENDER_OPEN_ID"] = open_id
+        sess.extra_env["FEISHU_SENDER_ID_TYPE"] = "open_id"
+        if FEISHU_APP_ID:
+            sess.extra_env["FEISHU_APP_ID"] = FEISHU_APP_ID
+        if FEISHU_APP_SECRET:
+            sess.extra_env["FEISHU_APP_SECRET"] = FEISHU_APP_SECRET
+    return sess
 
 
 # 全局后台 event loop：所有协程共用，避免 session 内 asyncio 对象（subprocess、
