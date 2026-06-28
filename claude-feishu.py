@@ -563,6 +563,37 @@ _FEISHU_SEND_PROMPT = (
 )
 
 
+def _load_bot_persona() -> str:
+    """加载本 bot 的人设(角色设定),作为 system prompt 注入。
+    优先级:BOT_PERSONA(内联文本) > BOT_PERSONA_FILE(角色 .md 路径,自动去掉 frontmatter)。
+    两个环境变量都不设时返回空,行为与原版完全一致(适合单 bot / 主网关)。"""
+    inline = os.environ.get("BOT_PERSONA", "").strip()
+    if inline:
+        return inline
+    path = os.environ.get("BOT_PERSONA_FILE", "").strip()
+    if not path:
+        return ""
+    path = os.path.expanduser(path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except Exception as e:
+        print(f"[WARN] 读取人设文件失败 {path}: {e}")
+        return ""
+    # 去掉 YAML frontmatter（--- ... ---），只留正文作为人设
+    if raw.startswith("---"):
+        seg = raw.split("---", 2)
+        if len(seg) == 3:
+            raw = seg[2]
+    return raw.strip()
+
+
+_BOT_PERSONA = _load_bot_persona()
+_BOT_NAME = os.environ.get("BOT_NAME", "").strip()
+if _BOT_PERSONA:
+    print(f"   🎭 人设已加载: {_BOT_NAME or '(未命名)'}（{len(_BOT_PERSONA)} 字）")
+
+
 def _get_session(open_id: str) -> ClaudeSession:
     if open_id not in _sessions:
         _sessions[open_id] = ClaudeSession()
@@ -577,8 +608,12 @@ def _get_session(open_id: str) -> ClaudeSession:
             sess.extra_env["FEISHU_APP_ID"] = FEISHU_APP_ID
         if FEISHU_APP_SECRET:
             sess.extra_env["FEISHU_APP_SECRET"] = FEISHU_APP_SECRET
+    _parts = []
+    if _BOT_PERSONA:
+        _parts.append(_BOT_PERSONA)
     if os.path.isfile(_SEND_FILE_TOOL):
-        sess.extra_append_prompt = _FEISHU_SEND_PROMPT
+        _parts.append(_FEISHU_SEND_PROMPT)
+    sess.extra_append_prompt = "\n\n".join(_parts)
     return sess
 
 

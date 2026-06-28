@@ -395,6 +395,35 @@ python3 tools/feishu-send-file.py /path/to/video.mp4 ou_xxxxxxxx   # 发给指�
 
 ---
 
+## 多 bot / 角色人设（同一份代码跑多个专家 bot）
+
+同一份 `claude-feishu.py` 可以用**不同凭证 + 不同人设**同时跑成多个独立的飞书 bot（比如「研究员」「工程师」「复盘」各一个聊天窗），互不干扰、各自持久会话。
+
+### 原理
+
+启动时读两个可选环境变量，把人设作为 `--append-system-prompt` 注入 Claude（与发文件提示自动合并）：
+
+| 环境变量 | 说明 |
+|---------|------|
+| `BOT_PERSONA` | 直接内联一段人设文本（优先级最高） |
+| `BOT_PERSONA_FILE` | 指向一个角色 `.md` 文件，自动去掉 YAML frontmatter 后作为人设 |
+| `BOT_NAME` | 仅用于启动日志显示 |
+
+两者都不设时行为与原版完全一致（通用无人设），**对现有单 bot / 主网关零影响**。
+
+### 用法
+
+```bash
+cp .env.role.example .env.research      # 复制模板
+# 编辑 .env.research：填该 bot 的飞书 App ID/Secret、CLAUDE_CWD、BOT_PERSONA_FILE
+bash start-bot.sh research              # 以「research 角色」启动；日志 bot-research.log
+```
+
+`start-bot.sh <role>` 会 source `.env.<role>`，用仓库 `venv`（没有则系统 `python3`）启动网关。
+`.env.<role>` 含私有凭证，已被 `.gitignore` 忽略，**不入库**；提交的只有 `.env.role.example` 模板。
+
+---
+
 ## 注意事项
 
 - **凭证保护**：`.env` 已在 `.gitignore`，任何情况下不要把 Token / Secret 提交到仓库

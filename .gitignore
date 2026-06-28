@@ -1,7 +1,10 @@
 .env
-# 各 bot 的私有凭证（.env.feishu2/.env.feishu3 等），绝不入库；保留 .env.example 模板
+# 各 bot 的私有凭证（.env.feishu2/.env.feishu3/.env.<role> 等），绝不入库；只保留模板
 .env.*
 !.env.example
+!.env.role.example
+# 多 bot 运行日志
+bot-*.log
 __pycache__/
 *.pyc
 *.pyo
