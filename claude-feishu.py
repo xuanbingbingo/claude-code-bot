@@ -45,8 +45,17 @@ if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
 FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 MAX_MSG_LEN = 3800
 
-# 每个 open_id → ClaudeSession
+# 每个会话 id(私聊=open_id / 群=chat_id) → ClaudeSession
 _sessions: dict[str, ClaudeSession] = {}
+
+# 回复目标类型登记表：会话 id → receive_id_type（open_id / chat_id）。
+# 收到消息时登记，发送函数据此自动决定回私聊还是回群，无需逐处改函数签名。
+_reply_type: dict[str, str] = {}
+
+
+def _recv_type_for(receive_id: str, explicit: str = "") -> str:
+    """决定 receive_id_type：显式参数优先，否则查登记表，默认 open_id（向后兼容）。"""
+    return explicit or _reply_type.get(receive_id, "open_id")
 
 
 # ── 飞书 API 同步封装 ─────────────────────────────────────────
@@ -62,7 +71,7 @@ def _get_tenant_access_token() -> str:
     return data.get("tenant_access_token", "")
 
 
-def _send_message_sync(receive_id: str, msg_type: str, content: dict, receive_id_type: str = "open_id") -> dict:
+def _send_message_sync(receive_id: str, msg_type: str, content: dict, receive_id_type: str = "") -> dict:
     token = _get_tenant_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
@@ -72,7 +81,7 @@ def _send_message_sync(receive_id: str, msg_type: str, content: dict, receive_id
     }
     resp = httpx.post(
         f"{FEISHU_BASE_URL}/im/v1/messages",
-        params={"receive_id_type": receive_id_type},
+        params={"receive_id_type": _recv_type_for(receive_id, receive_id_type)},
         headers=headers,
         json=payload,
         timeout=30,
@@ -98,7 +107,7 @@ def _build_card(text: str) -> dict:
     }
 
 
-def _send_card_sync(receive_id: str, text: str, receive_id_type: str = "open_id") -> dict:
+def _send_card_sync(receive_id: str, text: str, receive_id_type: str = "") -> dict:
     token = _get_tenant_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
@@ -108,7 +117,7 @@ def _send_card_sync(receive_id: str, text: str, receive_id_type: str = "open_id"
     }
     resp = httpx.post(
         f"{FEISHU_BASE_URL}/im/v1/messages",
-        params={"receive_id_type": receive_id_type},
+        params={"receive_id_type": _recv_type_for(receive_id, receive_id_type)},
         headers=headers,
         json=payload,
         timeout=30,
@@ -602,8 +611,10 @@ def _get_session(open_id: str) -> ClaudeSession:
     # 供仓库内 tools/feishu-send-file.py 实现「发文件到当前飞书聊天窗」。
     # 一个 session 固定服务一个 open_id，每次取用时刷一遍幂等，开销可忽略。
     if open_id:
+        # open_id 这里实为「当前会话 id」：私聊=对方 open_id，群聊=chat_id。
+        # 注入对应类型，让 feishu-send-file 在群里也能发到群。
         sess.extra_env["FEISHU_SENDER_OPEN_ID"] = open_id
-        sess.extra_env["FEISHU_SENDER_ID_TYPE"] = "open_id"
+        sess.extra_env["FEISHU_SENDER_ID_TYPE"] = _reply_type.get(open_id, "open_id")
         if FEISHU_APP_ID:
             sess.extra_env["FEISHU_APP_ID"] = FEISHU_APP_ID
         if FEISHU_APP_SECRET:
@@ -1269,24 +1280,41 @@ def _process_message_event(event: P2ImMessageReceiveV1):
         sender_id = data.sender.sender_id.open_id if data.sender and data.sender.sender_id else ""
         content = json.loads(message.content) if message.content else {}
 
-        print(f"[DEBUG] 收到消息: msg_type={msg_type}, sender_id={sender_id}, message_id={message_id}, content={content}")
+        # 群聊 vs 私聊：群聊把回复发回群(chat_id)，私聊发回发起人(open_id)。
+        # 群里只有 @ 机器人的消息才会被推送过来(im:message.group_at_msg:readonly)，
+        # 故收到群消息即视为被 @，直接响应。
+        chat_type = getattr(message, "chat_type", "") or ""
+        chat_id = getattr(message, "chat_id", "") or ""
+        if chat_type == "group" and chat_id:
+            recv_id, recv_type = chat_id, "chat_id"
+        else:
+            recv_id, recv_type = sender_id, "open_id"
+        _reply_type[recv_id] = recv_type
+
+        print(f"[DEBUG] 收到消息: msg_type={msg_type}, chat_type={chat_type or 'p2p'}, recv_id={recv_id}, message_id={message_id}, content={content}")
 
         if msg_type == "text":
             text = content.get("text", "").strip()
+            # 群里 @ 机器人时正文含 @_user_N 占位，按 mentions 去掉以免污染 prompt
+            for _m in (getattr(message, "mentions", None) or []):
+                _k = getattr(_m, "key", "") or ""
+                if _k:
+                    text = text.replace(_k, "")
+            text = text.strip()
             if text.startswith("/"):
-                if _handle_command(sender_id, text):
+                if _handle_command(recv_id, text):
                     return
-            _run_async(_handle_text_message(sender_id, text))
+            _run_async(_handle_text_message(recv_id, text))
         elif msg_type == "image":
             file_key = content.get("image_key", "")
-            _run_async(_handle_image_message(sender_id, message_id, file_key))
+            _run_async(_handle_image_message(recv_id, message_id, file_key))
         elif msg_type == "audio":
             file_key = content.get("file_key", "")
-            _run_async(_handle_audio_message(sender_id, message_id, file_key))
+            _run_async(_handle_audio_message(recv_id, message_id, file_key))
         elif msg_type == "file":
             file_key = content.get("file_key", "")
             file_name = content.get("file_name", "")
-            _run_async(_handle_file_message(sender_id, message_id, file_key, file_name))
+            _run_async(_handle_file_message(recv_id, message_id, file_key, file_name))
         else:
             print(f"[DEBUG] 暂不支持的消息类型: {msg_type}")
     except Exception as e:
