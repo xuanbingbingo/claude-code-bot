@@ -612,12 +612,31 @@ try:
     _RELAY_MAX_HOPS = max(1, int(os.environ.get("BOT_MAX_HOPS", "5") or "5"))
 except ValueError:
     _RELAY_MAX_HOPS = 5
-_RELAY_TEAMMATES = [n.strip() for n in os.environ.get("BOT_TEAMMATES", "").split(",") if n.strip()]
+
+
+def _parse_teammates(raw: str) -> dict:
+    """解析 BOT_TEAMMATES：支持 '别名:飞书显示名'（别名=bot 回复里会用的称呼，
+    显示名=群名册里用来查 open_id 的名字）；省略冒号时别名=显示名。
+    例: 'quant-research:首席分析师,quant-engineer:量化工程师'
+    返回 {别名: 显示名}。"""
+    out: dict[str, str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        alias, _, disp = item.partition(":")
+        alias, disp = alias.strip(), disp.strip()
+        if alias:
+            out[alias] = disp or alias
+    return out
+
+
+_RELAY_TEAMMATES = _parse_teammates(os.environ.get("BOT_TEAMMATES", ""))  # 别名 -> 显示名
 _RELAY_TAG_RE = re.compile(r"〔接力\s*(\d+)/\d+〕")
 _roster_cache: dict[str, dict] = {}   # chat_id -> {成员名: open_id}
 _incoming_hop: dict[str, int] = {}    # 会话 id -> 该会话当前消息的跳数
 if _RELAY_ENABLED:
-    print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={_RELAY_TEAMMATES or '(未配置)'}")
+    print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={list(_RELAY_TEAMMATES) or '(未配置)'}")
 
 
 def _parse_hop(text: str) -> int:
@@ -656,16 +675,26 @@ def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> None:
         return
     if incoming_hop >= _RELAY_MAX_HOPS:
         return  # 到顶，不再接力，级联自然停止
-    targeted = [n for n in _RELAY_TEAMMATES if f"@{n}" in response]
-    if not targeted:
-        return
     roster = _roster_for(chat_id)
-    name_to_oid = {n: roster[n] for n in targeted if n in roster}
-    if not name_to_oid:
-        print(f"[WARN] relay: 队友 {targeted} 还不在名册(已知:{list(roster)});先在群里 @ 一遍全员让各 bot 学到 open_id")
+    # 对每个队友：bot 回复里若出现 @别名 或 @显示名，就解析成真实 open_id
+    repl: dict[str, str] = {}        # 文本里要替换的 @名字 -> open_id
+    wanted: list[str] = []           # bot 想 @ 但名册还没学到的
+    for alias, disp in _RELAY_TEAMMATES.items():
+        oid = roster.get(disp) or roster.get(alias)
+        mentioned = [nm for nm in {alias, disp} if f"@{nm}" in response]
+        if not mentioned:
+            continue
+        if oid:
+            for nm in mentioned:
+                repl[nm] = oid
+        else:
+            wanted.append(disp)
+    if not repl:
+        if wanted:
+            print(f"[WARN] relay: 想 @ {wanted} 但名册还没对应 open_id(已知:{list(roster)});先在群里 @ 一遍全员让各 bot 学到")
         return
     out = response
-    for name, oid in name_to_oid.items():
+    for name, oid in repl.items():
         out = out.replace(f"@{name}", f'<at user_id="{oid}"></at>')
     out = f"{out}\n〔接力 {incoming_hop + 1}/{_RELAY_MAX_HOPS}〕"
     try:
@@ -678,7 +707,7 @@ def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> None:
                   "content": json.dumps({"text": out}, ensure_ascii=False)},
             timeout=30,
         )
-        print(f"[RELAY] hop {incoming_hop}->{incoming_hop + 1} @ {list(name_to_oid)}")
+        print(f"[RELAY] hop {incoming_hop}->{incoming_hop + 1} @ {list(repl)}")
     except Exception as e:
         print(f"[WARN] relay 发送失败: {e}")
 
@@ -687,11 +716,12 @@ def _relay_system_prompt() -> str:
     """告诉 bot 它能 @ 队友协作（仅在开启且配置了队友时注入）。"""
     if not (_RELAY_ENABLED and _RELAY_TEAMMATES):
         return ""
-    mates = "、".join(_RELAY_TEAMMATES)
+    mates = "、".join(_RELAY_TEAMMATES.keys())
     return (
         f"你在一个多 bot 协作群里，你的队友有：{mates}。\n"
         "当某个子任务明显更适合某位队友时，在你回复的**最后单独一行**写 "
-        "`@队友名 要交代的话`，系统会自动把它转发给那位队友接力处理。\n"
+        "`@队友名 要交代的话`（队友名必须用上面列出的确切名字），"
+        "系统会自动把它转发给那位队友接力处理。\n"
         "克制使用：能自己完成就别 @；每条最多 @ 一位队友；别为了客套而 @。"
     )
 
