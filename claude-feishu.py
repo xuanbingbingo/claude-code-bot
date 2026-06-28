@@ -257,8 +257,13 @@ class FeishuStreamerV1:
             self.status = ""
             await self._schedule()
 
-    async def finalize(self, fallback: str = ""):
+    async def finalize(self, fallback: str = "", override_text: str = ""):
         self.status = ""
+        if override_text:
+            await asyncio.to_thread(
+                _update_card_sync, self.message_id, override_text.strip()[:self.MAX_LEN]
+            )
+            return
         if not self.has_content:
             text = (fallback or "").strip()
             if not text:
@@ -522,7 +527,7 @@ class FeishuStreamerV2:
         self._thinking = ""
         await self._schedule()
 
-    async def finalize(self, fallback: str = ""):
+    async def finalize(self, fallback: str = "", override_text: str = ""):
         self._finalized = True
         if self._hb_task and not self._hb_task.done():
             self._hb_task.cancel()
@@ -531,6 +536,13 @@ class FeishuStreamerV2:
         self.current_status = ""
         if self._pending_task and not self._pending_task.done():
             self._pending_task.cancel()
+
+        # override_text：无视已流式的正文，把卡片收起成一行（接力时用，避免内容重复）
+        if override_text:
+            self.steps = []
+            self.text = override_text.strip()
+            await self._do_edit()
+            return
 
         if not self.has_content:
             text = (fallback or "").strip() or "✅ 完成（无文字输出）"
@@ -669,12 +681,14 @@ def _harvest_mentions(chat_id: str, mentions) -> None:
             book[name] = oid
 
 
-def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> None:
-    """若开启 relay 且 bot 回复里 @ 了队友且未超跳数，把任务接力给队友。"""
+def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> bool:
+    """若开启 relay 且 bot 回复里 @ 了队友且未超跳数，把任务接力给队友。
+    返回 True 表示已发出接力消息（这条文本即群里唯一的内容消息，调用方应据此
+    把上面的流式卡片收起成一行提示，避免同一段内容在群里出现两次）。"""
     if not (_RELAY_ENABLED and chat_id and response and _RELAY_TEAMMATES):
-        return
+        return False
     if incoming_hop >= _RELAY_MAX_HOPS:
-        return  # 到顶，不再接力，级联自然停止
+        return False  # 到顶，不再接力，级联自然停止
     roster = _roster_for(chat_id)
     # 对每个队友：bot 回复里若出现 @别名 或 @显示名，就解析成真实 open_id
     repl: dict[str, str] = {}        # 文本里要替换的 @名字 -> open_id
@@ -692,7 +706,7 @@ def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> None:
     if not repl:
         if wanted:
             print(f"[WARN] relay: 想 @ {wanted} 但名册还没对应 open_id(已知:{list(roster)});先在群里 @ 一遍全员让各 bot 学到")
-        return
+        return False
     out = response
     for name, oid in repl.items():
         out = out.replace(f"@{name}", f'<at user_id="{oid}"></at>')
@@ -708,8 +722,10 @@ def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> None:
             timeout=30,
         )
         print(f"[RELAY] hop {incoming_hop}->{incoming_hop + 1} @ {list(repl)}")
+        return True
     except Exception as e:
         print(f"[WARN] relay 发送失败: {e}")
+        return False
 
 
 def _relay_system_prompt() -> str:
@@ -1206,18 +1222,26 @@ async def _handle_text_message(sender: str, text: str):
             )
         return
 
+    # bot 间协作：若在群里且回复 @ 了队友，先接力转发（带跳数上限防死循环）。
+    # relay 成功时，那条解析了 @ 的文本消息就是群里唯一的内容消息——所以下面
+    # 把流式卡片收起成一行提示/正常发送都跳过，避免同一段内容在群里出现两次。
+    relayed = False
+    if _reply_type.get(sender) == "chat_id":
+        relayed = await asyncio.to_thread(
+            _maybe_relay, sender, response, _incoming_hop.get(sender, 0)
+        )
+
     if streamer:
-        await streamer.finalize(fallback=response)
-    else:
+        if relayed:
+            await streamer.finalize(override_text="↳ 已 @ 队友接力，内容见下条")
+        else:
+            await streamer.finalize(fallback=response)
+    elif not relayed:
         for i in range(0, len(response), MAX_MSG_LEN):
             await asyncio.to_thread(
                 _send_message_sync, sender, "text",
                 {"text": response[i:i + MAX_MSG_LEN]},
             )
-
-    # bot 间协作：若在群里且回复 @ 了队友，接力转发（带跳数上限防死循环）
-    if _reply_type.get(sender) == "chat_id":
-        await asyncio.to_thread(_maybe_relay, sender, response, _incoming_hop.get(sender, 0))
 
 
 async def _handle_image_message(sender: str, message_id: str, file_key: str, caption: str = ""):
