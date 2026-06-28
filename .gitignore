@@ -24,6 +24,9 @@ venv/
 
 # 运行时文件
 *.pid
+# relay 名册缓存（运行时学到的 open_id 映射，本机数据不入库）
+roster-cache.json
+roster-cache.json.*.tmp
 
 # 备份/临时文件
 *.bak

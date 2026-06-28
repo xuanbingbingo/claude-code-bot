@@ -669,6 +669,63 @@ _RELAY_TEAMMATES = _parse_teammates(os.environ.get("BOT_TEAMMATES", ""))  # 别�
 _RELAY_TAG_RE = re.compile(r"〔接力\s*(\d+)/\d+〕")
 _roster_cache: dict[str, dict] = {}   # chat_id -> {成员名: open_id}
 _incoming_hop: dict[str, int] = {}    # 会话 id -> 该会话当前消息的跳数
+# 名册落盘文件：relay 靠它在进程重启后不丢「谁是谁(open_id)」，且同机多个角色 bot
+# 共享同一份——任一 bot 学到，其它 bot 重启/回看时都能用上。并发写用「读-合并-原子
+# 替换」避免多进程互相覆盖或写坏。
+_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roster-cache.json")
+
+
+def _load_roster_from_disk(verbose: bool = False) -> None:
+    """把磁盘名册并回内存（进程重启不再失忆）。verbose 仅启动时打印一次。"""
+    try:
+        with open(_ROSTER_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print(f"[WARN] 名册恢复失败: {e}")
+        return
+    if isinstance(data, dict):
+        for cid, book in data.items():
+            if isinstance(book, dict):
+                _roster_cache.setdefault(cid, {}).update(book)
+        if verbose:
+            n = sum(len(v) for v in _roster_cache.values())
+            if n:
+                print(f"   📒 名册已从磁盘恢复: {n} 条 open_id")
+
+
+def _save_roster_to_disk() -> None:
+    """内存名册与磁盘已有内容合并后原子落盘；合并结果回灌内存以跨 bot 共享。"""
+    try:
+        merged: dict[str, dict] = {}
+        try:
+            with open(_ROSTER_FILE, encoding="utf-8") as f:
+                disk = json.load(f)
+            if isinstance(disk, dict):
+                for cid, book in disk.items():
+                    if isinstance(book, dict):
+                        merged[cid] = dict(book)
+        except FileNotFoundError:
+            pass
+        for cid, book in _roster_cache.items():
+            merged.setdefault(cid, {}).update(book)
+            _roster_cache.setdefault(cid, {}).update(merged[cid])
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_ROSTER_FILE) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _ROSTER_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        print(f"[WARN] 名册落盘失败: {e}")
+
+
 if _RELAY_ENABLED:
     print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={list(_RELAY_TEAMMATES) or '(未配置)'}")
 
@@ -686,21 +743,30 @@ def _strip_hop_tag(text: str) -> str:
 def _roster_for(chat_id: str) -> dict:
     """返回本群已知的 {成员名: open_id}（本 bot 视角）。
     飞书群成员接口不返回 bot 成员，但消息 mentions 含被 @ 者的 open_id，
-    故名册从收到的群消息 mentions 里被动积累——队友被 @ 过一次就学到了。"""
-    return _roster_cache.get(chat_id, {})
+    故名册从收到的群消息 mentions 里被动积累——队友被 @ 过一次就学到了。
+    内存查不到时回看磁盘一次：同机其它 bot 可能已学到并落盘。"""
+    book = _roster_cache.get(chat_id)
+    if not book:
+        _load_roster_from_disk()
+        book = _roster_cache.get(chat_id, {})
+    return book
 
 
 def _harvest_mentions(chat_id: str, mentions) -> None:
-    """把消息 mentions 里的 名字→open_id 存进本群名册。"""
+    """把消息 mentions 里的 名字→open_id 存进本群名册；有新增即落盘持久化。"""
     if not chat_id:
         return
     book = _roster_cache.setdefault(chat_id, {})
+    changed = False
     for m in mentions or []:
         name = getattr(m, "name", "") or ""
         mid = getattr(m, "id", None)
         oid = getattr(mid, "open_id", "") if mid else ""
-        if name and oid:
+        if name and oid and book.get(name) != oid:
             book[name] = oid
+            changed = True
+    if changed:
+        _save_roster_to_disk()
 
 
 def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> bool:
@@ -1533,6 +1599,9 @@ def _handle_message_event(event: P2ImMessageReceiveV1):
 def main():
     print("🤖 Claude Code Feishu Gateway 启动中（长连接模式）...")
     print(f"   App ID: {FEISHU_APP_ID[:8]}...")
+
+    # 进程重启后把名册读回内存，relay 不再失忆
+    _load_roster_from_disk(verbose=True)
 
     # 提前启动后台 loop，确保第一条消息进来时 loop 已就绪
     _start_background_loop()
