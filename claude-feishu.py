@@ -146,6 +146,28 @@ def _update_card_sync(message_id: str, text: str) -> dict:
     return data
 
 
+def _delete_message_sync(message_id: str) -> bool:
+    """撤回（删除）一条 bot 自己发的消息。接力时用来删掉那张流式卡片，
+    让解析了 @ 的文本消息成为群里唯一的内容消息。删失败返回 False（调用方据此降级）。"""
+    if not message_id:
+        return False
+    try:
+        token = _get_tenant_access_token()
+        resp = httpx.delete(
+            f"{FEISHU_BASE_URL}/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            print(f"[WARN] delete_message failed: {data}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[WARN] delete_message 异常: {e}")
+        return False
+
+
 def _download_resource_sync(message_id: str, file_key: str, rtype: str, save_path: str) -> bool:
     """下载消息里的图片 / 文件（语音）。rtype ∈ {'image', 'file'}。"""
     token = _get_tenant_access_token()
@@ -1233,7 +1255,11 @@ async def _handle_text_message(sender: str, text: str):
 
     if streamer:
         if relayed:
+            # 接力那条文本（已解析 @）是群里唯一的内容消息：先收起流式卡片做清理，
+            # 再把它删掉。删成功→只剩接力一条；删失败→退回成一行提示，不会断链。
             await streamer.finalize(override_text="↳ 已 @ 队友接力，内容见下条")
+            if reply_id:
+                await asyncio.to_thread(_delete_message_sync, reply_id)
         else:
             await streamer.finalize(fallback=response)
     elif not relayed:
