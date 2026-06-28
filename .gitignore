@@ -28,3 +28,6 @@ venv/
 # 备份/临时文件
 *.bak
 *.bak-*
+
+# bot 名册缓存(含 open_id,按 app 隔离,不入库)
+.roster-*.json

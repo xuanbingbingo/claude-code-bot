@@ -669,8 +669,34 @@ _RELAY_TEAMMATES = _parse_teammates(os.environ.get("BOT_TEAMMATES", ""))  # 别�
 _RELAY_TAG_RE = re.compile(r"〔接力\s*(\d+)/\d+〕")
 _roster_cache: dict[str, dict] = {}   # chat_id -> {成员名: open_id}
 _incoming_hop: dict[str, int] = {}    # 会话 id -> 该会话当前消息的跳数
+# 名册持久化：把从 mentions 学到的 名字→open_id 存盘，重启/睡眠后不必重新「@全员」种子。
+# 按 app_id 隔离（open_id 是各 bot 自己命名空间的）。
+_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), f".roster-{FEISHU_APP_ID}.json")
+
+
+def _load_roster() -> None:
+    try:
+        if os.path.isfile(_ROSTER_FILE):
+            with open(_ROSTER_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _roster_cache.update({k: v for k, v in data.items() if isinstance(v, dict)})
+                print(f"   📇 名册已恢复: {sum(len(v) for v in _roster_cache.values())} 个成员")
+    except Exception as e:
+        print(f"[WARN] 载入名册失败: {e}")
+
+
+def _save_roster() -> None:
+    try:
+        with open(_ROSTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(_roster_cache, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] 保存名册失败: {e}")
+
+
 if _RELAY_ENABLED:
     print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={list(_RELAY_TEAMMATES) or '(未配置)'}")
+    _load_roster()
 
 
 def _parse_hop(text: str) -> int:
@@ -722,12 +748,16 @@ def _harvest_mentions(chat_id: str, mentions) -> None:
     if not chat_id:
         return
     book = _roster_cache.setdefault(chat_id, {})
+    changed = False
     for m in mentions or []:
         name = getattr(m, "name", "") or ""
         mid = getattr(m, "id", None)
         oid = getattr(mid, "open_id", "") if mid else ""
-        if name and oid:
+        if name and oid and book.get(name) != oid:
             book[name] = oid
+            changed = True
+    if changed:
+        _save_roster()
 
 
 def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> bool:
@@ -784,10 +814,13 @@ def _relay_system_prompt() -> str:
     mates = "、".join(_RELAY_TEAMMATES.keys())
     return (
         f"你在一个多 bot 协作群里，你的队友有：{mates}。\n"
-        "当某个子任务明显更适合某位队友时，在你回复的**最后单独一行**写 "
-        "`@队友名 要交代的话`（队友名必须用上面列出的确切名字），"
-        "系统会自动把它转发给那位队友接力处理。\n"
-        "克制使用：能自己完成就别 @；每条最多 @ 一位队友；别为了客套而 @。"
+        "**收尾规则（重要）**：当你完成自己负责的这一棒、得出阶段性结论或产出后，"
+        "必须用回复的**最后单独一行**写 `@队友名 要交代的话`，把球传给合适的队友让协作链继续——"
+        "有可执行的产出/规格 → 交给负责执行的队友；判负、需要决策或复盘汇报 → @ 负责统筹的队友。"
+        "（队友名必须用上面列出的确切名字。）\n"
+        "**不要**只对发起人说一句「决策权在你 / 你定」就停下——那样链路就断了；"
+        "除非任务确实彻底完结、没有任何下一棒，才可以不 @。\n"
+        "克制：每条最多 @ 一位队友，别为了客套而 @。"
     )
 
 
