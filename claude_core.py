@@ -9,6 +9,7 @@ import base64
 import glob
 import json
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -538,7 +539,12 @@ class ClaudeSession:
         return True
 
     async def stop(self) -> bool:
-        """终止当前运行中的 Claude 子进程，返回是否实际杀掉了东西。"""
+        """终止当前运行中的 Claude 子进程，返回是否实际杀掉了东西。
+
+        加固：杀进程信号必发（不依赖事件循环，跨线程/跨 loop 也生效）；
+        等待回收的任何异常（含「Future attached to a different loop」）一律吞掉，
+        保证 /stop 永远干净返回——进程信号已发出，任务一定会被杀。
+        """
         proc = self.current_proc
         if proc is None or proc.returncode is not None:
             return False
@@ -546,17 +552,28 @@ class ClaudeSession:
             proc.terminate()
         except ProcessLookupError:
             return False
+        except Exception:
+            try:
+                os.kill(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=2.0)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
-            except ProcessLookupError:
-                pass
+            except Exception:
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except Exception:
                 pass
+        except Exception:
+            # 跨 loop 等待异常：信号已发出，忽略
+            pass
         return True
 
     async def run_claude(self, prompt: str, streamer=None) -> str:
