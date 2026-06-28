@@ -10,6 +10,7 @@ Claude Code Feishu (Lark) Gateway - 长连接模式
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -603,6 +604,98 @@ if _BOT_PERSONA:
     print(f"   🎭 人设已加载: {_BOT_NAME or '(未命名)'}（{len(_BOT_PERSONA)} 字）")
 
 
+# ── bot 间协作（relay，通用功能）─────────────────────────────────
+# 群里 bot 被 @ 后，可在回复里 @ 队友把任务接力下去；用「跳数上限」防死循环。
+# 跳数跟着消息文本传递（bot 各自独立进程，内存计数器跨不了进程，文本标记最可靠）。
+_RELAY_ENABLED = os.environ.get("BOT_RELAY", "") == "1"
+try:
+    _RELAY_MAX_HOPS = max(1, int(os.environ.get("BOT_MAX_HOPS", "5") or "5"))
+except ValueError:
+    _RELAY_MAX_HOPS = 5
+_RELAY_TEAMMATES = [n.strip() for n in os.environ.get("BOT_TEAMMATES", "").split(",") if n.strip()]
+_RELAY_TAG_RE = re.compile(r"〔接力\s*(\d+)/\d+〕")
+_roster_cache: dict[str, dict] = {}   # chat_id -> {成员名: open_id}
+_incoming_hop: dict[str, int] = {}    # 会话 id -> 该会话当前消息的跳数
+if _RELAY_ENABLED:
+    print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={_RELAY_TEAMMATES or '(未配置)'}")
+
+
+def _parse_hop(text: str) -> int:
+    """从消息文本解析当前跳数；无标记=0（人发起的新一轮，预算满血）。"""
+    m = _RELAY_TAG_RE.search(text or "")
+    return int(m.group(1)) if m else 0
+
+
+def _strip_hop_tag(text: str) -> str:
+    return _RELAY_TAG_RE.sub("", text or "").strip()
+
+
+def _roster_for(chat_id: str) -> dict:
+    """返回本群已知的 {成员名: open_id}（本 bot 视角）。
+    飞书群成员接口不返回 bot 成员，但消息 mentions 含被 @ 者的 open_id，
+    故名册从收到的群消息 mentions 里被动积累——队友被 @ 过一次就学到了。"""
+    return _roster_cache.get(chat_id, {})
+
+
+def _harvest_mentions(chat_id: str, mentions) -> None:
+    """把消息 mentions 里的 名字→open_id 存进本群名册。"""
+    if not chat_id:
+        return
+    book = _roster_cache.setdefault(chat_id, {})
+    for m in mentions or []:
+        name = getattr(m, "name", "") or ""
+        mid = getattr(m, "id", None)
+        oid = getattr(mid, "open_id", "") if mid else ""
+        if name and oid:
+            book[name] = oid
+
+
+def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> None:
+    """若开启 relay 且 bot 回复里 @ 了队友且未超跳数，把任务接力给队友。"""
+    if not (_RELAY_ENABLED and chat_id and response and _RELAY_TEAMMATES):
+        return
+    if incoming_hop >= _RELAY_MAX_HOPS:
+        return  # 到顶，不再接力，级联自然停止
+    targeted = [n for n in _RELAY_TEAMMATES if f"@{n}" in response]
+    if not targeted:
+        return
+    roster = _roster_for(chat_id)
+    name_to_oid = {n: roster[n] for n in targeted if n in roster}
+    if not name_to_oid:
+        print(f"[WARN] relay: 队友 {targeted} 还不在名册(已知:{list(roster)});先在群里 @ 一遍全员让各 bot 学到 open_id")
+        return
+    out = response
+    for name, oid in name_to_oid.items():
+        out = out.replace(f"@{name}", f'<at user_id="{oid}"></at>')
+    out = f"{out}\n〔接力 {incoming_hop + 1}/{_RELAY_MAX_HOPS}〕"
+    try:
+        token = _get_tenant_access_token()
+        httpx.post(
+            f"{FEISHU_BASE_URL}/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"receive_id": chat_id, "msg_type": "text",
+                  "content": json.dumps({"text": out}, ensure_ascii=False)},
+            timeout=30,
+        )
+        print(f"[RELAY] hop {incoming_hop}->{incoming_hop + 1} @ {list(name_to_oid)}")
+    except Exception as e:
+        print(f"[WARN] relay 发送失败: {e}")
+
+
+def _relay_system_prompt() -> str:
+    """告诉 bot 它能 @ 队友协作（仅在开启且配置了队友时注入）。"""
+    if not (_RELAY_ENABLED and _RELAY_TEAMMATES):
+        return ""
+    mates = "、".join(_RELAY_TEAMMATES)
+    return (
+        f"你在一个多 bot 协作群里，你的队友有：{mates}。\n"
+        "当某个子任务明显更适合某位队友时，在你回复的**最后单独一行**写 "
+        "`@队友名 要交代的话`，系统会自动把它转发给那位队友接力处理。\n"
+        "克制使用：能自己完成就别 @；每条最多 @ 一位队友；别为了客套而 @。"
+    )
+
+
 def _get_session(open_id: str) -> ClaudeSession:
     if open_id not in _sessions:
         _sessions[open_id] = ClaudeSession()
@@ -622,6 +715,9 @@ def _get_session(open_id: str) -> ClaudeSession:
     _parts = []
     if _BOT_PERSONA:
         _parts.append(_BOT_PERSONA)
+    _relay_p = _relay_system_prompt()
+    if _relay_p:
+        _parts.append(_relay_p)
     if os.path.isfile(_SEND_FILE_TOOL):
         _parts.append(_FEISHU_SEND_PROMPT)
     sess.extra_append_prompt = "\n\n".join(_parts)
@@ -1089,6 +1185,10 @@ async def _handle_text_message(sender: str, text: str):
                 {"text": response[i:i + MAX_MSG_LEN]},
             )
 
+    # bot 间协作：若在群里且回复 @ 了队友，接力转发（带跳数上限防死循环）
+    if _reply_type.get(sender) == "chat_id":
+        await asyncio.to_thread(_maybe_relay, sender, response, _incoming_hop.get(sender, 0))
+
 
 async def _handle_image_message(sender: str, message_id: str, file_key: str, caption: str = ""):
     if not file_key or not sender or not message_id:
@@ -1291,7 +1391,22 @@ def _process_message_event(event: P2ImMessageReceiveV1):
             recv_id, recv_type = sender_id, "open_id"
         _reply_type[recv_id] = recv_type
 
-        print(f"[DEBUG] 收到消息: msg_type={msg_type}, chat_type={chat_type or 'p2p'}, recv_id={recv_id}, message_id={message_id}, content={content}")
+        # 从 mentions 被动积累群名册（名字→open_id），供 bot 间 @ 协作解析
+        if chat_id:
+            _harvest_mentions(chat_id, getattr(message, "mentions", None))
+
+        # 发送者是人(user)还是 bot(app)——bot 间协作防循环的关键信号
+        sender_type = (getattr(data.sender, "sender_type", "") or "") if data.sender else ""
+        is_bot_sender = (sender_type == "app")
+        # relay 未开启时，忽略群里其它 bot 发来的消息，避免意外互相触发
+        if recv_type == "chat_id" and is_bot_sender and not _RELAY_ENABLED:
+            print("[DEBUG] 忽略 bot 发来的群消息（relay 未开启）")
+            return
+        # 跳数随文本传递（跨进程可靠）；人发起=0，预算满血
+        hop = _parse_hop(content.get("text", "")) if msg_type == "text" else 0
+        _incoming_hop[recv_id] = hop
+
+        print(f"[DEBUG] 收到消息: msg_type={msg_type}, chat_type={chat_type or 'p2p'}, sender={sender_type or 'user'}, hop={hop}, recv_id={recv_id}, content={content}")
 
         if msg_type == "text":
             text = content.get("text", "").strip()
@@ -1300,6 +1415,7 @@ def _process_message_event(event: P2ImMessageReceiveV1):
                 _k = getattr(_m, "key", "") or ""
                 if _k:
                     text = text.replace(_k, "")
+            text = _strip_hop_tag(text)  # 去掉接力跳数标记
             text = text.strip()
             if text.startswith("/"):
                 if _handle_command(recv_id, text):
