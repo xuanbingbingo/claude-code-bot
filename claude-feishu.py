@@ -284,6 +284,10 @@ class FeishuStreamerV2:
     BUDGET = _CARD_BUDGET_BYTES
     THROTTLE = 0.25  # 飞书单条消息更新硬限 5 QPS（200ms），留 50ms 余量
 
+    _HB_INTERVAL = 3.0           # 心跳：静默超过该秒数就刷新一次状态，避免「卡死」观感
+    _HB_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _HB_MAX = 240               # 心跳最多存活 240*3s=12min，防孤儿任务长刷死卡
+
     def __init__(self, receive_id: str, message_id: str):
         self.receive_id = receive_id
         self.message_id = message_id
@@ -295,6 +299,11 @@ class FeishuStreamerV2:
         self.partial_mode = False
         self._dirty = False
         self._pending_task: asyncio.Task | None = None
+        self._thinking = ""
+        self._finalized = False
+        self._hb_task: asyncio.Task | None = None
+        self._hb_frame = 0
+        self._phase_start = 0.0
 
     @staticmethod
     def _is_archivable(status: str) -> bool:
@@ -329,9 +338,25 @@ class FeishuStreamerV2:
             sections.append(status_part)
         return "\n\n".join(sections) if sections else "⏳ 处理中..."
 
+    def _status_line(self) -> str:
+        """渲染状态行：未结束时带 spinner + 已耗时，保证视觉上「一直在动」。"""
+        if self._finalized:
+            return ""
+        # 正文正在流式输出且无显式状态时，不额外加状态行（正文本身在动）
+        if not self.current_status and self.has_content:
+            return ""
+        spin = self._HB_FRAMES[self._hb_frame % len(self._HB_FRAMES)]
+        label = self.current_status or "⏳ 处理中"
+        elapsed = ""
+        if self._phase_start:
+            secs = int(time.monotonic() - self._phase_start)
+            if secs >= 2:
+                elapsed = f"（{secs}s）"
+        return f"**{spin} {label}{elapsed}**"
+
     def _compose(self) -> str:
         text_part = self.text or ""
-        status_part = f"**🔄 {self.current_status}**" if self.current_status else ""
+        status_part = self._status_line()
 
         full = self._assemble(self._render_steps(), text_part, status_part)
         if _byte_len(full) <= self.BUDGET:
@@ -379,11 +404,80 @@ class FeishuStreamerV2:
         else:
             self._pending_task = asyncio.create_task(self._delayed_edit(self.THROTTLE - elapsed))
 
+    def _ensure_heartbeat(self):
+        """惰性启动心跳。任何静默期（扩展思考 / 长工具执行）持续刷新状态行，
+        卡片永远在动，根治「没事件就卡死」的观感。"""
+        if self._hb_task is None and not self._finalized:
+            try:
+                self._hb_task = asyncio.create_task(self._heartbeat())
+            except RuntimeError:
+                self._hb_task = None
+
+    async def _heartbeat(self):
+        try:
+            for _ in range(self._HB_MAX):
+                await asyncio.sleep(self._HB_INTERVAL)
+                if self._finalized:
+                    return
+                # 仅在确实静默（最近一次编辑已过去 ~1 个心跳周期）时补刷
+                if time.monotonic() - self.last_edit >= self._HB_INTERVAL - 0.3:
+                    self._hb_frame += 1
+                    self._dirty = True
+                    await self._do_edit()
+        except asyncio.CancelledError:
+            return
+
+    def _mark_phase(self):
+        """进入一个新「阶段」（思考/工具/输出）时重置耗时计时。"""
+        self._phase_start = time.monotonic()
+
+    async def add_thinking(self, chunk: str):
+        """扩展思考增量：把最新思考片段滚进状态行（不进正文、不归档）。"""
+        if not chunk:
+            return
+        if not self._thinking:
+            self._mark_phase()
+        self._thinking += chunk
+        tail = self._thinking[-70:].replace("\n", " ").strip()
+        self.current_status = f"💭 {tail}"
+        self._ensure_heartbeat()
+        await self._schedule()
+
+    async def _rollover(self):
+        """当前卡片快撑满 25KB 前，先把它定格为完整内容，再开一张新卡片继续。
+
+        修复 V2 回归：旧逻辑超预算直接从尾部截断正文，导致卡片"冻住/截断"。
+        这里改成像 V1 一样滚动到新卡，长回答跨多张卡片，内容永不丢。
+        """
+        # 当前卡此刻仍在预算内，_do_edit 会完整渲染、不截断
+        await self._do_edit()
+        try:
+            result = await asyncio.to_thread(
+                _send_card_sync, self.receive_id, "⏳ 接上条继续…"
+            )
+            new_id = result.get("data", {}).get("message_id", "")
+            if new_id:
+                self.message_id = new_id
+        except Exception:
+            pass
+        # 新卡从干净状态开始（步骤已在上一张卡体现）
+        self.text = ""
+        self.steps = []
+        self.current_status = ""
+        self.last_edit = 0.0
+        if self._pending_task and not self._pending_task.done():
+            self._pending_task.cancel()
+
     async def append(self, chunk: str):
         if not chunk:
             return
         self.has_content = True
+        # 预判：加上这段后整卡是否会超预算；会则先滚动到新卡片，避免截断/冻结
+        if self.text and _byte_len(self._compose()) + _byte_len(chunk) > self.BUDGET:
+            await self._rollover()
         self.text += chunk
+        self._thinking = ""        # 出现正文＝思考阶段结束
+        self._ensure_heartbeat()
         await self._schedule()
 
     async def set_status(self, line: str):
@@ -392,6 +486,9 @@ class FeishuStreamerV2:
         if self._is_archivable(self.current_status):
             self.steps.append(self.current_status)
         self.current_status = line
+        self._thinking = ""
+        self._mark_phase()
+        self._ensure_heartbeat()
         await self._schedule()
 
     async def clear_status(self):
@@ -400,9 +497,13 @@ class FeishuStreamerV2:
         if self._is_archivable(self.current_status):
             self.steps.append(self.current_status)
         self.current_status = ""
+        self._thinking = ""
         await self._schedule()
 
     async def finalize(self, fallback: str = ""):
+        self._finalized = True
+        if self._hb_task and not self._hb_task.done():
+            self._hb_task.cancel()
         if self._is_archivable(self.current_status):
             self.steps.append(self.current_status)
         self.current_status = ""

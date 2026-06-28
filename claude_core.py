@@ -15,6 +15,24 @@ from datetime import datetime
 
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
 
+# 失败后自动重置会话的提示：避免下一条消息继续 resume 这个已卡死/超时的脏会话，
+# 打破「一个会话坏了之后条条都失败」的恶性循环。
+_RESET_NOTE = "\n\n🔄 已自动重置会话（下一条消息从全新开始，不再接续这个卡住的会话）。"
+
+# 单次 claude 执行超时（秒）。长任务被砍会导致飞书消息「没返回全」，默认放宽到 600s（10 分钟）。
+# 可用环境变量 CLAUDE_RUN_TIMEOUT 覆盖。
+_RUN_TIMEOUT = int(os.environ.get("CLAUDE_RUN_TIMEOUT", "600"))
+_RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_TIMEOUT // 60} 分钟）。{_RESET_NOTE}"
+
+# 静默看门狗：单次超过该秒数没有任何流输出，判定 API 流卡死（stalled），
+# 立即中断而不是干等总超时。可用 CLAUDE_STALL_TIMEOUT 覆盖。
+_STALL_TIMEOUT = int(os.environ.get("CLAUDE_STALL_TIMEOUT", "180"))
+_STALL_MSG = f"⚠️ 模型响应卡住了（{_STALL_TIMEOUT}s 无任何输出），已自动中断。多半是 API 流中断。{_RESET_NOTE}"
+
+
+class _StreamStalled(Exception):
+    """流在中途静默超过 _STALL_TIMEOUT，判定卡死。"""
+
 _WHISPER_MODEL = None
 
 
@@ -411,6 +429,11 @@ async def _dispatch_event(event: dict, streamer):
                 txt = delta.get("text") or ""
                 if txt:
                     await streamer.append(txt)
+            elif dt == "thinking_delta":
+                # 扩展思考增量：实时滚进状态行，避免思考期卡片「卡死」
+                think = delta.get("thinking") or ""
+                if think and hasattr(streamer, "add_thinking"):
+                    await streamer.add_thinking(think)
         elif et == "content_block_stop":
             await streamer.clear_status()
     elif t == "assistant":
@@ -574,7 +597,16 @@ class ClaudeSession:
         async def _read():
             nonlocal result_text, raw_tail, result_is_error
             history_logged = False
-            async for line in proc.stdout:
+            while True:
+                # 单行读取设静默上限：超过 _STALL_TIMEOUT 没有任何输出＝流卡死
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=_STALL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    raise _StreamStalled()
+                if not line:
+                    break  # EOF，进程正常结束
                 decoded = line.decode("utf-8", errors="replace")
                 raw_tail = (raw_tail + decoded)[-4096:]
                 print(decoded, end="", flush=True)
@@ -601,15 +633,28 @@ class ClaudeSession:
 
         try:
             try:
-                await asyncio.wait_for(_read(), timeout=300)
+                await asyncio.wait_for(_read(), timeout=_RUN_TIMEOUT)
                 await proc.wait()
+            except _StreamStalled:
+                proc.kill()
+                await proc.wait()
+                self.set_new_session()   # 脏会话不再续，下条从全新开始
+                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断并重置会话")
+                if streamer:
+                    await streamer.clear_status()
+                    if getattr(streamer, "has_content", False):
+                        await streamer.append(f"\n\n{_STALL_MSG}")
+                return _STALL_MSG
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
                 print("\n⏰ 执行超时")
+                self.set_new_session()   # 超时多半是会话已劣化，下条从全新开始
                 if streamer:
                     await streamer.clear_status()
-                return "❌ 执行超时（超过5分钟）"
+                    if getattr(streamer, "has_content", False):
+                        await streamer.append(f"\n\n{_RUN_TIMEOUT_MSG}")
+                return _RUN_TIMEOUT_MSG
         finally:
             if self.current_proc is proc:
                 self.current_proc = None
@@ -688,7 +733,15 @@ class ClaudeSession:
             await proc.stdin.drain()
             proc.stdin.close()
             history_logged = False
-            async for line in proc.stdout:
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=_STALL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    raise _StreamStalled()
+                if not line:
+                    break
                 decoded = line.decode("utf-8", errors="replace")
                 print(decoded, end="", flush=True)
                 s = decoded.strip()
@@ -712,14 +765,27 @@ class ClaudeSession:
 
         try:
             try:
-                await asyncio.wait_for(_stream(), timeout=300)
+                await asyncio.wait_for(_stream(), timeout=_RUN_TIMEOUT)
                 await proc.wait()
+            except _StreamStalled:
+                proc.kill()
+                await proc.wait()
+                self.set_new_session()   # 脏会话不再续，下条从全新开始
+                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断并重置会话")
+                if streamer:
+                    await streamer.clear_status()
+                    if getattr(streamer, "has_content", False):
+                        await streamer.append(f"\n\n{_STALL_MSG}")
+                return _STALL_MSG
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
+                self.set_new_session()   # 超时多半是会话已劣化，下条从全新开始
                 if streamer:
                     await streamer.clear_status()
-                return "❌ 执行超时（超过5分钟）"
+                    if getattr(streamer, "has_content", False):
+                        await streamer.append(f"\n\n{_RUN_TIMEOUT_MSG}")
+                return _RUN_TIMEOUT_MSG
         finally:
             if self.current_proc is proc:
                 self.current_proc = None
