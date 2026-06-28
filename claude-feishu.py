@@ -444,6 +444,17 @@ class FeishuStreamerV2:
         self._ensure_heartbeat()
         await self._schedule()
 
+    async def set_thinking_progress(self, tokens: int):
+        """思考内容被中转脱敏（空串）时，用 token 计数做实时进度，
+        不重置阶段计时，让深度思考看起来一直在动而不是假死。"""
+        if self._thinking:
+            return  # 已有真思考文本在滚，token 计数让位
+        if not self._phase_start:
+            self._mark_phase()
+        self.current_status = f"💭 思考中 ~{tokens} tokens"
+        self._ensure_heartbeat()
+        await self._schedule()
+
     async def _rollover(self):
         """当前卡片快撑满 25KB 前，先把它定格为完整内容，再开一张新卡片继续。
 

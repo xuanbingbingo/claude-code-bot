@@ -16,19 +16,28 @@ from datetime import datetime
 
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
 
-# 失败后自动重置会话的提示：避免下一条消息继续 resume 这个已卡死/超时的脏会话，
-# 打破「一个会话坏了之后条条都失败」的恶性循环。
-_RESET_NOTE = "\n\n🔄 已自动重置会话（下一条消息从全新开始，不再接续这个卡住的会话）。"
+# 失败后的提示：保留会话（不自动重置），用户可直接重发接着干；
+# 如确实想重开，自己发 /new。网络抖动等临时问题不该丢掉整个会话上下文。
+_RETRY_NOTE = "\n\n↩️ 会话已保留，直接重发即可接着上面继续；如想重开会话发 /new。"
 
 # 单次 claude 执行超时（秒）。长任务被砍会导致飞书消息「没返回全」，默认放宽到 600s（10 分钟）。
 # 可用环境变量 CLAUDE_RUN_TIMEOUT 覆盖。
 _RUN_TIMEOUT = int(os.environ.get("CLAUDE_RUN_TIMEOUT", "600"))
-_RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_TIMEOUT // 60} 分钟）。{_RESET_NOTE}"
+_RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_TIMEOUT // 60} 分钟）。{_RETRY_NOTE}"
 
 # 静默看门狗：单次超过该秒数没有任何流输出，判定 API 流卡死（stalled），
 # 立即中断而不是干等总超时。可用 CLAUDE_STALL_TIMEOUT 覆盖。
 _STALL_TIMEOUT = int(os.environ.get("CLAUDE_STALL_TIMEOUT", "180"))
-_STALL_MSG = f"⚠️ 模型响应卡住了（{_STALL_TIMEOUT}s 无任何输出），已自动中断。多半是 API 流中断。{_RESET_NOTE}"
+
+# 逐 token 流式开关，默认开（飞书要像 CLI 一样实时流式）。
+# 可用 CLAUDE_PARTIAL_MESSAGES=0 关闭。
+_PARTIAL_FLAG = (["--include-partial-messages"]
+                 if os.environ.get("CLAUDE_PARTIAL_MESSAGES", "1") != "0" else [])
+
+# 思考深度上限（token）。Opus 高强度扩展思考会跑几分钟，飞书上看着像卡死。
+# 给一个上限让响应保持迅捷；可用 CLAUDE_MAX_THINKING 调整，设 "0" 取消上限。
+_MAX_THINKING = os.environ.get("CLAUDE_MAX_THINKING", "8000").strip()
+_STALL_MSG = f"⚠️ 模型响应卡住了（{_STALL_TIMEOUT}s 无任何输出），已中断。多半是 API 流中断。{_RETRY_NOTE}"
 
 
 class _StreamStalled(Exception):
@@ -448,6 +457,11 @@ async def _dispatch_event(event: dict, streamer):
                 await streamer.set_status(_format_tool_use(block))
     elif t == "user":
         await streamer.clear_status()
+    elif t == "system" and event.get("subtype") == "thinking_tokens":
+        # 思考内容常被中转脱敏成空串，这里用 token 计数做实时进度显示
+        tokens = event.get("estimated_tokens")
+        if tokens is not None and hasattr(streamer, "set_thinking_progress"):
+            await streamer.set_thinking_progress(tokens)
     elif t == "system" and event.get("subtype") == "status":
         status = event.get("status", "")
         if status == "requesting" and not streamer.has_content:
@@ -512,6 +526,13 @@ class ClaudeSession:
         if not self.new_session:
             return ["--continue"]
         return []
+
+    def _spawn_env(self) -> dict:
+        """spawn claude 用的环境：合并进程环境 + 会话注入 + 思考上限。"""
+        env = {**os.environ, **self.extra_env}
+        if _MAX_THINKING and _MAX_THINKING != "0":
+            env["MAX_THINKING_TOKENS"] = _MAX_THINKING
+        return env
 
     def _build_cmd_prefix(self) -> list[str]:
         """组合 mode + model，返回 `claude <mode-flag> [--model <x>]`。"""
@@ -589,7 +610,9 @@ class ClaudeSession:
             + session_flags
             + [
                 "--output-format", "stream-json",
-                "--include-partial-messages",
+            ]
+            + _PARTIAL_FLAG
+            + [
                 "--verbose",
                 "-p", prompt,
             ]
@@ -603,7 +626,7 @@ class ClaudeSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.cwd,
-            env={**os.environ, **self.extra_env},
+            env=self._spawn_env(),
         )
         self.current_proc = proc
 
@@ -655,8 +678,7 @@ class ClaudeSession:
             except _StreamStalled:
                 proc.kill()
                 await proc.wait()
-                self.set_new_session()   # 脏会话不再续，下条从全新开始
-                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断并重置会话")
+                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断，会话保留")
                 if streamer:
                     await streamer.clear_status()
                     if getattr(streamer, "has_content", False):
@@ -666,7 +688,6 @@ class ClaudeSession:
                 proc.kill()
                 await proc.wait()
                 print("\n⏰ 执行超时")
-                self.set_new_session()   # 超时多半是会话已劣化，下条从全新开始
                 if streamer:
                     await streamer.clear_status()
                     if getattr(streamer, "has_content", False):
@@ -725,7 +746,9 @@ class ClaudeSession:
                 "-p",
                 "--input-format", "stream-json",
                 "--output-format", "stream-json",
-                "--include-partial-messages",
+            ]
+            + _PARTIAL_FLAG
+            + [
                 "--verbose",
             ]
         )
@@ -738,7 +761,7 @@ class ClaudeSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.cwd,
-            env={**os.environ, **self.extra_env},
+            env=self._spawn_env(),
         )
         self.current_proc = proc
 
@@ -787,8 +810,7 @@ class ClaudeSession:
             except _StreamStalled:
                 proc.kill()
                 await proc.wait()
-                self.set_new_session()   # 脏会话不再续，下条从全新开始
-                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断并重置会话")
+                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断，会话保留")
                 if streamer:
                     await streamer.clear_status()
                     if getattr(streamer, "has_content", False):
@@ -797,7 +819,6 @@ class ClaudeSession:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
-                self.set_new_session()   # 超时多半是会话已劣化，下条从全新开始
                 if streamer:
                     await streamer.clear_status()
                     if getattr(streamer, "has_content", False):
