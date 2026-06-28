@@ -395,14 +395,15 @@ class FeishuStreamerV2:
             await self._do_edit()
 
     async def _schedule(self):
+        # 关键：绝不在调用方(读取循环)里 await 飞书 PATCH，否则飞书一慢就把
+        # claude 输出管道堵死、claude 被迫阻塞写入 → 表现为「思考中卡死」。
+        # 一律丢到后台 task 异步刷卡片，读取循环只设脏标记立即返回，永不背压。
         self._dirty = True
         if self._pending_task and not self._pending_task.done():
             return
         elapsed = time.monotonic() - self.last_edit
-        if elapsed >= self.THROTTLE:
-            await self._do_edit()
-        else:
-            self._pending_task = asyncio.create_task(self._delayed_edit(self.THROTTLE - elapsed))
+        delay = 0 if elapsed >= self.THROTTLE else (self.THROTTLE - elapsed)
+        self._pending_task = asyncio.create_task(self._delayed_edit(delay))
 
     def _ensure_heartbeat(self):
         """惰性启动心跳。任何静默期（扩展思考 / 长工具执行）持续刷新状态行，
