@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 !.env.role.example
+!.env.wecom.role.example
 # 多 bot 运行日志
 bot-*.log
 __pycache__/
