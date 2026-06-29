@@ -422,6 +422,54 @@ bash start-bot.sh research              # 以「research 角色」启动；日�
 `start-bot.sh <role>` 会 source `.env.<role>`，用仓库 `venv`（没有则系统 `python3`）启动网关。
 `.env.<role>` 含私有凭证，已被 `.gitignore` 忽略，**不入库**；提交的只有 `.env.role.example` 模板。
 
+### 一键创建新角色 bot（推荐）
+
+`scripts/new-agent.sh` 把上面的本地步骤（生成 `.env.<role>` + launchd 自启 + 启动）合成一条命令：
+
+```bash
+# 先在飞书开放平台为该角色建一个企业自建应用并发布，拿到 App ID/Secret，然后：
+bash scripts/new-agent.sh researcher cli_xxx secret_yyy ~/.claude/agents/researcher.md 研究员
+```
+
+它会：① 生成 `.env.researcher` ② 生成 launchd 自启配置 ③ 启动 bot。
+人设文件用 [Claude Code 子代理格式](agents-example/role.md)（frontmatter + 正文＝角色系统提示），模板见 `agents-example/role.md`。
+
+> 唯一不能自动的是「在飞书开放平台建应用拿 App ID/Secret」——飞书不开放用 API 建应用，这步要你在网页完成。
+> 要让新角色在群里 @ 队友协作，再在它的 `.env.<role>` 里加 `BOT_RELAY=1` / `BOT_TEAMMATES`（见 `.env.role.example`）。
+
+---
+
+## macOS 7×24 部署（防睡眠 + 长任务超时）
+
+把网关挂在 Mac 上长期跑、用手机远程时，有两个坑会导致「手机端能收到但回复到一半就断」：
+
+### 1. 防止 Mac 睡眠（最关键）
+
+Mac 一睡眠就会冻结网关进程：**正在生成的回复会停在一半，长连接也会断**。装一个常驻防睡眠服务：
+
+```bash
+bash scripts/macos-keep-awake.sh        # 安装并启动（launchd 常驻，开机自启、退出自拉起）
+bash scripts/macos-keep-awake.sh stop   # 卸载
+```
+
+它用 `caffeinate -i -m -s` 阻止空闲/磁盘/系统睡眠。**⚠️ 务必知道它的边界**：
+
+- `-s`（阻止系统睡眠）**只在【插电】时生效**；
+- caffeinate **无法阻止【合盖睡眠 / clamshell】**。
+- 👉 所以要真正稳定 7×24：**插上电源 + 保持开盖**。合盖或纯电池仍会进入维护睡眠（约每 15 分钟一次），导致手机端断断续续。
+- 若必须合盖运行（自担过热风险）：`sudo pmset disablesleep 1`。
+
+### 2. 放宽单条回复超时（跑回测/数据分析等长任务）
+
+网关给每条回复设了超时，默认 10 分钟，重活会被掐断（回复只出一半）。用环境变量调大，写进各 bot 的 `.env` / `.env.<role>`：
+
+```env
+CLAUDE_RUN_TIMEOUT=1800     # 单条回复上限(秒)，默认 600
+CLAUDE_STALL_TIMEOUT=600    # 流静默多久判「卡死」(秒)，默认 180；长工具调用(回测)要调大避免误杀
+```
+
+改完重启对应 bot 生效。
+
 ---
 
 ## 注意事项

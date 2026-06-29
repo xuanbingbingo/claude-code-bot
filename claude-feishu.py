@@ -669,65 +669,34 @@ _RELAY_TEAMMATES = _parse_teammates(os.environ.get("BOT_TEAMMATES", ""))  # 别�
 _RELAY_TAG_RE = re.compile(r"〔接力\s*(\d+)/\d+〕")
 _roster_cache: dict[str, dict] = {}   # chat_id -> {成员名: open_id}
 _incoming_hop: dict[str, int] = {}    # 会话 id -> 该会话当前消息的跳数
-# 名册落盘文件：relay 靠它在进程重启后不丢「谁是谁(open_id)」，且同机多个角色 bot
-# 共享同一份——任一 bot 学到，其它 bot 重启/回看时都能用上。并发写用「读-合并-原子
-# 替换」避免多进程互相覆盖或写坏。
-_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roster-cache.json")
+# 名册持久化：把从 mentions 学到的 名字→open_id 存盘，重启/睡眠后不必重新「@全员」种子。
+# 按 app_id 隔离（open_id 是各 bot 自己命名空间的）。
+_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), f".roster-{FEISHU_APP_ID}.json")
 
 
-def _load_roster_from_disk(verbose: bool = False) -> None:
-    """把磁盘名册并回内存（进程重启不再失忆）。verbose 仅启动时打印一次。"""
+def _load_roster() -> None:
     try:
-        with open(_ROSTER_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return
-    except Exception as e:
-        print(f"[WARN] 名册恢复失败: {e}")
-        return
-    if isinstance(data, dict):
-        for cid, book in data.items():
-            if isinstance(book, dict):
-                _roster_cache.setdefault(cid, {}).update(book)
-        if verbose:
-            n = sum(len(v) for v in _roster_cache.values())
-            if n:
-                print(f"   📒 名册已从磁盘恢复: {n} 条 open_id")
-
-
-def _save_roster_to_disk() -> None:
-    """内存名册与磁盘已有内容合并后原子落盘；合并结果回灌内存以跨 bot 共享。"""
-    try:
-        merged: dict[str, dict] = {}
-        try:
+        if os.path.isfile(_ROSTER_FILE):
             with open(_ROSTER_FILE, encoding="utf-8") as f:
-                disk = json.load(f)
-            if isinstance(disk, dict):
-                for cid, book in disk.items():
-                    if isinstance(book, dict):
-                        merged[cid] = dict(book)
-        except FileNotFoundError:
-            pass
-        for cid, book in _roster_cache.items():
-            merged.setdefault(cid, {}).update(book)
-            _roster_cache.setdefault(cid, {}).update(merged[cid])
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_ROSTER_FILE) or ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, _ROSTER_FILE)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                data = json.load(f)
+            if isinstance(data, dict):
+                _roster_cache.update({k: v for k, v in data.items() if isinstance(v, dict)})
+                print(f"   📇 名册已恢复: {sum(len(v) for v in _roster_cache.values())} 个成员")
     except Exception as e:
-        print(f"[WARN] 名册落盘失败: {e}")
+        print(f"[WARN] 载入名册失败: {e}")
+
+
+def _save_roster() -> None:
+    try:
+        with open(_ROSTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(_roster_cache, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] 保存名册失败: {e}")
 
 
 if _RELAY_ENABLED:
     print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={list(_RELAY_TEAMMATES) or '(未配置)'}")
+    _load_roster()
 
 
 def _parse_hop(text: str) -> int:
@@ -740,6 +709,33 @@ def _strip_hop_tag(text: str) -> str:
     return _RELAY_TAG_RE.sub("", text or "").strip()
 
 
+def _extract_post(content) -> tuple:
+    """从 post(富文本)消息里递归抠出 纯文本 和 image_key 列表。
+    兼容飞书 post 的多种嵌套/语言包裹结构（content 是按行的元素数组）。"""
+    texts: list[str] = []
+    imgs: list[str] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            tag = node.get("tag")
+            if tag in ("text", "a", "md") and node.get("text"):
+                texts.append(node["text"])
+            elif tag == "img" and node.get("image_key"):
+                imgs.append(node["image_key"])
+            # at 标签跳过（@ 由 mentions 单独处理）；继续递归子结构
+            for v in node.values():
+                if isinstance(v, (list, dict)):
+                    walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it)
+
+    title = content.get("title", "") if isinstance(content, dict) else ""
+    walk(content)
+    text = (f"{title} " if title else "") + " ".join(texts)
+    return text.strip(), imgs
+
+
 def _roster_for(chat_id: str) -> dict:
     """返回本群已知的 {成员名: open_id}（本 bot 视角）。
     飞书群成员接口不返回 bot 成员，但消息 mentions 含被 @ 者的 open_id，
@@ -747,7 +743,7 @@ def _roster_for(chat_id: str) -> dict:
     内存查不到时回看磁盘一次：同机其它 bot 可能已学到并落盘。"""
     book = _roster_cache.get(chat_id)
     if not book:
-        _load_roster_from_disk()
+        _load_roster()
         book = _roster_cache.get(chat_id, {})
     return book
 
@@ -766,7 +762,7 @@ def _harvest_mentions(chat_id: str, mentions) -> None:
             book[name] = oid
             changed = True
     if changed:
-        _save_roster_to_disk()
+        _save_roster()
 
 
 def _maybe_relay(chat_id: str, response: str, incoming_hop: int) -> bool:
@@ -823,10 +819,13 @@ def _relay_system_prompt() -> str:
     mates = "、".join(_RELAY_TEAMMATES.keys())
     return (
         f"你在一个多 bot 协作群里，你的队友有：{mates}。\n"
-        "当某个子任务明显更适合某位队友时，在你回复的**最后单独一行**写 "
-        "`@队友名 要交代的话`（队友名必须用上面列出的确切名字），"
-        "系统会自动把它转发给那位队友接力处理。\n"
-        "克制使用：能自己完成就别 @；每条最多 @ 一位队友；别为了客套而 @。"
+        "**收尾规则（重要）**：当你完成自己负责的这一棒、得出阶段性结论或产出后，"
+        "必须用回复的**最后单独一行**写 `@队友名 要交代的话`，把球传给合适的队友让协作链继续——"
+        "有可执行的产出/规格 → 交给负责执行的队友；判负、需要决策或复盘汇报 → @ 负责统筹的队友。"
+        "（队友名必须用上面列出的确切名字。）\n"
+        "**不要**只对发起人说一句「决策权在你 / 你定」就停下——那样链路就断了；"
+        "除非任务确实彻底完结、没有任何下一棒，才可以不 @。\n"
+        "克制：每条最多 @ 一位队友，别为了客套而 @。"
     )
 
 
@@ -1388,6 +1387,10 @@ async def _handle_image_message(sender: str, message_id: str, file_key: str, cap
                 {"text": response[i:i + MAX_MSG_LEN]},
             )
 
+    # bot 间协作：看图后若回复 @ 了队友，同样接力（群聊场景）
+    if _reply_type.get(sender) == "chat_id":
+        await asyncio.to_thread(_maybe_relay, sender, response, _incoming_hop.get(sender, 0))
+
 
 async def _handle_file_message(sender: str, message_id: str, file_key: str, file_name: str = ""):
     if not file_key or not sender or not message_id:
@@ -1577,6 +1580,16 @@ def _process_message_event(event: P2ImMessageReceiveV1):
             file_key = content.get("file_key", "")
             file_name = content.get("file_name", "")
             _run_async(_handle_file_message(recv_id, message_id, file_key, file_name))
+        elif msg_type == "post":
+            # 富文本：@ + 图片 + 文字混排（群里 @ 机器人配图就是这种）
+            ptext, pimgs = _extract_post(content)
+            ptext = _strip_hop_tag(ptext).strip()
+            print(f"[DEBUG] post 解析: 文字={ptext[:40]!r}, 图片数={len(pimgs)}")
+            if pimgs:
+                # 有图 → 走多模态(取第一张图 + 文字作说明)
+                _run_async(_handle_image_message(recv_id, message_id, pimgs[0], ptext))
+            elif ptext:
+                _run_async(_handle_text_message(recv_id, ptext))
         else:
             print(f"[DEBUG] 暂不支持的消息类型: {msg_type}")
     except Exception as e:
@@ -1601,7 +1614,7 @@ def main():
     print(f"   App ID: {FEISHU_APP_ID[:8]}...")
 
     # 进程重启后把名册读回内存，relay 不再失忆
-    _load_roster_from_disk(verbose=True)
+    _load_roster()
 
     # 提前启动后台 loop，确保第一条消息进来时 loop 已就绪
     _start_background_loop()
