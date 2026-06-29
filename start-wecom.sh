@@ -22,9 +22,11 @@ LOG_FILE="$SCRIPT_DIR/bot-wecom-$ROLE.log"
 
 set -a
 source "$ENV_FILE"
+export BOT_PLATFORM="${BOT_PLATFORM:-wecom}"       # 默认企微;.env 可覆盖
 set +a
 
 PYTHON="$SCRIPT_DIR/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="python3"
 
-"$PYTHON" "$SCRIPT_DIR/claude-wecom.py" >> "$LOG_FILE" 2>&1
+# 新分层架构统一入口(按 BOT_PLATFORM × BOT_BACKEND 装配)
+"$PYTHON" "$SCRIPT_DIR/run.py" >> "$LOG_FILE" 2>&1

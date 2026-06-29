@@ -22,13 +22,15 @@ fi
 
 LOG_FILE="$SCRIPT_DIR/bot-$ROLE.log"
 
-# set -a 让 source 进来的变量自动 export，确保 CLAUDE_CWD 在 python 导入 claude_core 前就生效
+# set -a 让 source 进来的变量自动 export，确保 CLAUDE_CWD 在 python 导入前就生效
 set -a
 source "$ENV_FILE"
+export BOT_PLATFORM="${BOT_PLATFORM:-feishu}"      # 默认飞书;.env 可覆盖
 set +a
 
 # 优先用仓库内 venv，没有则回退系统 python3
 PYTHON="$SCRIPT_DIR/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="python3"
 
-"$PYTHON" "$SCRIPT_DIR/claude-feishu.py" >> "$LOG_FILE" 2>&1
+# 新分层架构统一入口(按 BOT_PLATFORM × BOT_BACKEND 装配)
+"$PYTHON" "$SCRIPT_DIR/run.py" >> "$LOG_FILE" 2>&1
