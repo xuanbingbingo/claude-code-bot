@@ -422,6 +422,21 @@ bash start-bot.sh research              # 以「research 角色」启动；日�
 `start-bot.sh <role>` 会 source `.env.<role>`，用仓库 `venv`（没有则系统 `python3`）启动网关。
 `.env.<role>` 含私有凭证，已被 `.gitignore` 忽略，**不入库**；提交的只有 `.env.role.example` 模板。
 
+### 一键创建新角色 bot（推荐）
+
+`scripts/new-agent.sh` 把上面的本地步骤（生成 `.env.<role>` + launchd 自启 + 启动）合成一条命令：
+
+```bash
+# 先在飞书开放平台为该角色建一个企业自建应用并发布，拿到 App ID/Secret，然后：
+bash scripts/new-agent.sh researcher cli_xxx secret_yyy ~/.claude/agents/researcher.md 研究员
+```
+
+它会：① 生成 `.env.researcher` ② 生成 launchd 自启配置 ③ 启动 bot。
+人设文件用 [Claude Code 子代理格式](agents-example/role.md)（frontmatter + 正文＝角色系统提示），模板见 `agents-example/role.md`。
+
+> 唯一不能自动的是「在飞书开放平台建应用拿 App ID/Secret」——飞书不开放用 API 建应用，这步要你在网页完成。
+> 要让新角色在群里 @ 队友协作，再在它的 `.env.<role>` 里加 `BOT_RELAY=1` / `BOT_TEAMMATES`（见 `.env.role.example`）。
+
 ---
 
 ## macOS 7×24 部署（防睡眠 + 长任务超时）
