@@ -34,3 +34,4 @@ roster-cache.json.*.tmp
 
 # bot 名册缓存(含 open_id,按 app 隔离,不入库)
 .roster-*.json
+roster-cache.json.lock

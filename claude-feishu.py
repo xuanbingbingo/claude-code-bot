@@ -8,6 +8,7 @@ Claude Code Feishu (Lark) Gateway - 长连接模式
 """
 
 import asyncio
+import fcntl
 import json
 import os
 import re
@@ -669,34 +670,91 @@ _RELAY_TEAMMATES = _parse_teammates(os.environ.get("BOT_TEAMMATES", ""))  # 别�
 _RELAY_TAG_RE = re.compile(r"〔接力\s*(\d+)/\d+〕")
 _roster_cache: dict[str, dict] = {}   # chat_id -> {成员名: open_id}
 _incoming_hop: dict[str, int] = {}    # 会话 id -> 该会话当前消息的跳数
-# 名册持久化：把从 mentions 学到的 名字→open_id 存盘，重启/睡眠后不必重新「@全员」种子。
-# 按 app_id 隔离（open_id 是各 bot 自己命名空间的）。
-_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), f".roster-{FEISHU_APP_ID}.json")
+# 名册持久化：单个共享文件 roster-cache.json，结构 {app_id: {chat_id: {名字: open_id}}}。
+# 为什么按 app_id 分区：open_id 是飞书按 app 隔离的——同一个人，每个 bot 看到的 open_id 不同，
+# 混用会 @ 错人。所以一个文件、各 bot 只读写自己那段。
+# 多进程写同一文件，故「读整体-改本段-临时文件-原子替换」防并发写坏（采纳同事的原子写思路）。
+_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roster-cache.json")
+_OLD_ROSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), f".roster-{FEISHU_APP_ID}.json")
+_ROSTER_LOCK = threading.Lock()
 
 
-def _load_roster() -> None:
+def _read_roster_file() -> dict:
+    """读整个 roster-cache.json；坏/缺返回 {}。"""
     try:
         if os.path.isfile(_ROSTER_FILE):
             with open(_ROSTER_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                _roster_cache.update({k: v for k, v in data.items() if isinstance(v, dict)})
-                print(f"   📇 名册已恢复: {sum(len(v) for v in _roster_cache.values())} 个成员")
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
     except Exception as e:
-        print(f"[WARN] 载入名册失败: {e}")
+        print(f"[WARN] 读名册文件失败: {e}")
+    return {}
 
 
 def _save_roster() -> None:
+    """读整体 → 只改本 app 段 → 临时文件 → 原子替换。
+    用 flock 文件锁把「读-改-写」在【所有 bot 进程之间】串行化，防跨进程丢更新
+    （threading.Lock 只能锁进程内线程，4 个 bot 是独立进程，必须 flock）。"""
+    with _ROSTER_LOCK:                       # 进程内线程锁
+        lockpath = f"{_ROSTER_FILE}.lock"
+        try:
+            lf = open(lockpath, "w")
+        except Exception as e:
+            print(f"[WARN] 名册锁打开失败: {e}")
+            lf = None
+        try:
+            if lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)   # 跨进程独占锁
+            data = _read_roster_file()           # 锁内重新读，确保拿到别人最新写的
+            data[FEISHU_APP_ID] = _roster_cache
+            tmp = f"{_ROSTER_FILE}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, _ROSTER_FILE)
+        except Exception as e:
+            print(f"[WARN] 保存名册失败: {e}")
+        finally:
+            if lf:
+                try:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                    lf.close()
+                except Exception:
+                    pass
+
+
+def _load_roster(verbose: bool = False) -> None:
+    """把共享文件里【本 app】那段合并进内存（不清空，只补充）。"""
+    mine = _read_roster_file().get(FEISHU_APP_ID, {})
+    if isinstance(mine, dict):
+        for chat, members in mine.items():
+            if isinstance(members, dict):
+                _roster_cache.setdefault(chat, {}).update(members)
+    if verbose and _roster_cache:
+        print(f"   📇 名册已恢复: {sum(len(v) for v in _roster_cache.values())} 个成员")
+
+
+def _migrate_old_roster() -> None:
+    """首次切到 roster-cache.json：本 app 段为空但旧 .roster-<app>.json 还在 → 迁移进来。"""
+    if _read_roster_file().get(FEISHU_APP_ID):
+        return
     try:
-        with open(_ROSTER_FILE, "w", encoding="utf-8") as f:
-            json.dump(_roster_cache, f, ensure_ascii=False)
+        if os.path.isfile(_OLD_ROSTER_FILE):
+            old = json.load(open(_OLD_ROSTER_FILE, encoding="utf-8"))
+            if isinstance(old, dict) and old:
+                for chat, members in old.items():
+                    if isinstance(members, dict):
+                        _roster_cache.setdefault(chat, {}).update(members)
+                _save_roster()
+                print("   📇 已迁移旧名册 → roster-cache.json")
     except Exception as e:
-        print(f"[WARN] 保存名册失败: {e}")
+        print(f"[WARN] 迁移旧名册失败: {e}")
 
 
 if _RELAY_ENABLED:
     print(f"   🔗 bot 协作已开启: 最大跳数={_RELAY_MAX_HOPS}, 队友={list(_RELAY_TEAMMATES) or '(未配置)'}")
-    _load_roster()
+    _migrate_old_roster()
+    _load_roster(verbose=True)
 
 
 def _parse_hop(text: str) -> int:
@@ -963,6 +1021,12 @@ def _resolve_cwd_arg(session, arg: str) -> str | None:
 
 def _handle_command(sender: str, text: str) -> bool:
     text = text.strip()
+    if text.startswith("/seed"):
+        # 静默种子：被 @ 的成员已在收消息时由 _harvest_mentions 学进名册，
+        # 这里只确认、不触发 Claude 回复——避免「@全员认识新成员」时每个 bot 都自我介绍刷屏。
+        n = sum(len(v) for v in _roster_cache.values())
+        print(f"[SEED] 静默更新名册（不回话），本 bot 当前已知 {n} 个成员")
+        return True
     if text.startswith("/new"):
         session = _get_session(sender)
         session.set_new_session()
