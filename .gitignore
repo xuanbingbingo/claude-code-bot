@@ -36,3 +36,7 @@ roster-cache.json.*.tmp
 # bot 名册缓存(含 open_id,按 app 隔离,不入库)
 .roster-*.json
 roster-cache.json.lock
+
+# 会话指针持久化(含 open_id→session_id,按 app 隔离,本机运行时数据不入库)
+.sessions-*.json
+.sessions-*.json.*.tmp
