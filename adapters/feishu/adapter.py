@@ -46,6 +46,9 @@ class FeishuAdapter(PlatformAdapter):
         rt = "chat_id" if chat_type == "group" else "open_id"
         await asyncio.to_thread(self.api.send_message, conv_id, "text", {"text": text}, rt)
 
+    def state_key(self):
+        return self.app_id      # 飞书 app_id 唯一稳定非敏感,按 bot 隔离会话指针文件
+
     def backend_env(self, inbound):
         return {"FEISHU_SENDER_OPEN_ID": inbound.conv_id,
                 "FEISHU_SENDER_ID_TYPE": inbound.raw.get("_receive_id_type", "open_id"),

@@ -21,6 +21,10 @@ class TelegramAdapter(PlatformAdapter):
         self._app = None
         self._gateway = None
 
+    def state_key(self):
+        # token 形如 <botid>:<authstring>,冒号前的 botid 唯一稳定且非敏感,用它隔离(避免把密钥写进文件名)
+        return self.token.split(":", 1)[0]
+
     def make_streamer(self, inbound):
         return TelegramStreamer(inbound.raw["_reply_msg"])
 

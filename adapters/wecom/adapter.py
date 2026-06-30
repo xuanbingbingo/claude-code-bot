@@ -33,6 +33,9 @@ class WecomAdapter(PlatformAdapter):
         self._send_lock = asyncio.Lock()
         self._gateway = None
 
+    def state_key(self):
+        return self.bot_id      # 企微 bot_id 唯一稳定非敏感,按 bot 隔离会话指针文件
+
     # ---- 帧构造 ----
     def _frame_subscribe(self):
         return {"cmd": "aibot_subscribe", "headers": {"req_id": f"aibot_subscribe_{int(time.time()*1000)}"},

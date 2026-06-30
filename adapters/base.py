@@ -33,4 +33,9 @@ class PlatformAdapter(ABC):
         """平台工具的 system prompt 提示(飞书 send-file);拼进人设。"""
         return ""
 
+    def state_key(self) -> str:
+        """本 bot 的唯一稳定标识,用于会话指针持久化文件名(.sessions-<key>.json)隔离。
+        必须每个 bot 进程唯一且跨重启稳定、非敏感(进文件名)。返回 "" 则关闭持久化。"""
+        return ""
+
     # try_relay(inbound, response, relay_manager) -> bool 可选;飞书实现,其它不实现

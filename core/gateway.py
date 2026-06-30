@@ -22,6 +22,8 @@ class Gateway:
 
         # 命令(已处理则结束)
         if inbound.is_command and await self.commands.dispatch(inbound, backend, self.adapter):
+            # /new /resume /cwd 等会改变会话指针 → 落盘(persist 内部对未变化的会话自动跳过)
+            self.sessions.persist(inbound.conv_id)
             return
 
         # 跑智能体 + 流式回复
@@ -39,6 +41,9 @@ class Gateway:
         except Exception as e:
             await streamer.finalize(fallback=f"❌ 出错了：{e}")
             return
+
+        # 本轮会话指针落盘:current_session_id 已被 backend.run 刷成最新,重启后据此自动接回
+        self.sessions.persist(inbound.conv_id)
 
         # bot 间接力(群聊 + 开启 relay + 平台支持)
         if await self.relay.maybe_relay(inbound, resp, self.adapter):
