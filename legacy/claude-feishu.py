@@ -54,6 +54,53 @@ _sessions: dict[str, ClaudeSession] = {}
 # 收到消息时登记，发送函数据此自动决定回私聊还是回群，无需逐处改函数签名。
 _reply_type: dict[str, str] = {}
 
+# ── 会话指针持久化：进程重启后，每个 bot 各自接回各 open_id 重启前的会话 ──
+# 所有 bot 共用同一个 CLAUDE_CWD(~/aiProjects)，会话在 history.jsonl 里交织在一起，
+# 不能按目录取「最近会话」来恢复(会串到别的 bot)；故按 app_id 隔离文件、按 open_id
+# 逐条落盘各自的当前会话指针，重启时精确还原、互不干扰。
+_SESSIONS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), f".sessions-{FEISHU_APP_ID}.json"
+)
+_SESSIONS_LOCK = threading.Lock()
+# open_id -> session_id：启动时从磁盘加载，供 _get_session 首次建会话时恢复
+_persisted_sessions: dict[str, str] = {}
+
+
+def _load_persisted_sessions() -> None:
+    """进程启动时把上次的 {open_id: session_id} 读回内存。"""
+    global _persisted_sessions
+    try:
+        if os.path.isfile(_SESSIONS_FILE):
+            with open(_SESSIONS_FILE, encoding="utf-8") as f:
+                _persisted_sessions = json.load(f) or {}
+    except Exception as e:
+        print(f"[WARN] 加载会话指针失败：{e}")
+        _persisted_sessions = {}
+
+
+def _persist_session(open_id: str) -> None:
+    """把某 open_id 的当前会话指针原子落盘；current_session_id 为空则删除该条。"""
+    if not open_id:
+        return
+    sess = _sessions.get(open_id)
+    sid = sess.current_session_id if sess else None
+    with _SESSIONS_LOCK:
+        if sid:
+            if _persisted_sessions.get(open_id) == sid:
+                return  # 没变化，免去重复写盘
+            _persisted_sessions[open_id] = sid
+        else:
+            if open_id not in _persisted_sessions:
+                return
+            _persisted_sessions.pop(open_id, None)
+        try:
+            tmp = f"{_SESSIONS_FILE}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_persisted_sessions, f, ensure_ascii=False)
+            os.replace(tmp, _SESSIONS_FILE)
+        except Exception as e:
+            print(f"[WARN] 持久化会话指针失败：{e}")
+
 
 def _recv_type_for(receive_id: str, explicit: str = "") -> str:
     """决定 receive_id_type：显式参数优先，否则查登记表，默认 open_id（向后兼容）。"""
@@ -889,7 +936,13 @@ def _relay_system_prompt() -> str:
 
 def _get_session(open_id: str) -> ClaudeSession:
     if open_id not in _sessions:
-        _sessions[open_id] = ClaudeSession()
+        sess = ClaudeSession()
+        # 重启恢复：该 open_id 若有持久化会话且其 jsonl 仍在磁盘，预置 resume 指针，
+        # 下一条消息自动接回重启前的会话；jsonl 已删则照常开新会话，不报错。
+        sid = _persisted_sessions.get(open_id)
+        if sid and _session_file_exists(sid):
+            sess.set_resume_session(sid)
+        _sessions[open_id] = sess
     sess = _sessions[open_id]
     # 把「当前会话发起人」身份 + 当前 bot 凭证注入 claude 子进程环境，
     # 供仓库内 tools/feishu-send-file.py 实现「发文件到当前飞书聊天窗」。
@@ -1030,6 +1083,7 @@ def _handle_command(sender: str, text: str) -> bool:
     if text.startswith("/new"):
         session = _get_session(sender)
         session.set_new_session()
+        _persist_session(sender)  # 清掉旧指针，重启不再误接已弃会话
         _send_message_sync(sender, "text", {"text": "🔄 下一条消息将开启全新对话"})
         return True
     elif text.startswith("/sessions"):
@@ -1108,6 +1162,7 @@ def _handle_command(sender: str, text: str) -> bool:
                     t = datetime.fromtimestamp(s["timestamp"] / 1000).strftime("%m-%d %H:%M")
                     lines.append(f"[{t}] 🔖 {s['id']}")
                 _send_message_sync(sender, "text", {"text": "\n".join(lines)})
+        _persist_session(sender)  # 切换后的会话指针落盘，重启自动接回
         return True
     elif text.startswith("/rename"):
         parts = text.split(maxsplit=2)
@@ -1175,6 +1230,7 @@ def _handle_command(sender: str, text: str) -> bool:
             return True
 
         session.set_cwd(target)
+        _persist_session(sender)  # 切目录会重置会话，同步清掉旧指针
         if session.current_session_id:
             pool = list_sessions(1, cwd=target)
             summary = pool[0]["summary"] if pool else ""
@@ -1373,6 +1429,9 @@ async def _handle_text_message(sender: str, text: str):
             )
         return
 
+    # 会话指针落盘：current_session_id 已被 run_claude 刷成最新，重启后据此自动接回
+    _persist_session(sender)
+
     # bot 间协作：若在群里且回复 @ 了队友，先接力转发（带跳数上限防死循环）。
     # relay 成功时，那条解析了 @ 的文本消息就是群里唯一的内容消息——所以下面
     # 把流式卡片收起成一行提示/正常发送都跳过，避免同一段内容在群里出现两次。
@@ -1441,6 +1500,9 @@ async def _handle_image_message(sender: str, message_id: str, file_key: str, cap
             os.unlink(tmp_path)
         except Exception:
             pass
+
+    # 会话指针落盘：重启后据此自动接回
+    _persist_session(sender)
 
     if streamer:
         await streamer.finalize(fallback=response)
@@ -1573,6 +1635,9 @@ async def _handle_audio_message(sender: str, message_id: str, file_key: str):
             )
         return
 
+    # 会话指针落盘：重启后据此自动接回
+    _persist_session(sender)
+
     if streamer:
         await streamer.finalize(fallback=response)
     else:
@@ -1679,6 +1744,11 @@ def main():
 
     # 进程重启后把名册读回内存，relay 不再失忆
     _load_roster()
+
+    # 进程重启后把各 open_id 的会话指针读回内存，重启自动续接各自会话
+    _load_persisted_sessions()
+    if _persisted_sessions:
+        print(f"   已加载 {len(_persisted_sessions)} 条会话指针（重启自动续接）")
 
     # 提前启动后台 loop，确保第一条消息进来时 loop 已就绪
     _start_background_loop()

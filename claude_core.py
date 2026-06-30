@@ -20,9 +20,9 @@ CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
 # 如确实想重开，自己发 /new。网络抖动等临时问题不该丢掉整个会话上下文。
 _RETRY_NOTE = "\n\n↩️ 会话已保留，直接重发即可接着上面继续；如想重开会话发 /new。"
 
-# 单次 claude 执行超时（秒）。长任务被砍会导致飞书消息「没返回全」，默认放宽到 600s（10 分钟）。
+# 单次 claude 执行超时（秒）。长任务被砍会导致飞书消息「没返回全」，默认放宽到 1800s（30 分钟）。
 # 可用环境变量 CLAUDE_RUN_TIMEOUT 覆盖。
-_RUN_TIMEOUT = int(os.environ.get("CLAUDE_RUN_TIMEOUT", "600"))
+_RUN_TIMEOUT = int(os.environ.get("CLAUDE_RUN_TIMEOUT", "1800"))
 _RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_TIMEOUT // 60} 分钟）。{_RETRY_NOTE}"
 
 # 静默看门狗：单次超过该秒数没有任何流输出，判定 API 流卡死（stalled），
