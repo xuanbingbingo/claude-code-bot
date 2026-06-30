@@ -117,3 +117,9 @@ class StreamerBase(ABC):
         elif not self.has_content:
             self.text = (fallback or "").strip() or "✅ 完成（无文字输出）"
         await self._flush(True)
+
+    async def discard(self) -> bool:
+        """接力已另发独立 @ 消息后,丢弃本条流式过程消息,避免与接力消息重复。
+        基类无法真正撤回,退化为收尾一个极短指引;支持撤回的平台(飞书)覆盖本方法。"""
+        await self.finalize(override_text="↳ 已 @ 队友接力,内容见下条")
+        return False

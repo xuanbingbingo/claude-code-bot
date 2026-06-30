@@ -63,3 +63,14 @@ class FeishuStreamer(StreamerBase):
                 self.api.send_card, self.receive_id, rendered, self.receive_id_type)
         else:
             await asyncio.to_thread(self.api.update_card, self.message_id, rendered)
+
+    async def discard(self) -> bool:
+        """接力已另发带 <at> 的独立消息 → 撤回本条流式卡片,群里只剩那条能 @ 到人的消息。
+        撤回失败(无 id / 接口报错)则退化为收尾提示,绝不把卡片留在流式中间态。"""
+        self._finalized = True
+        if self._pending and not self._pending.done():
+            self._pending.cancel()
+        if self.message_id and await asyncio.to_thread(self.api.delete_message, self.message_id):
+            return True
+        await self.finalize(override_text="↳ 已 @ 队友接力,内容见下条")
+        return False

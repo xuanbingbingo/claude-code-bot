@@ -45,8 +45,8 @@ class Gateway:
         # 本轮会话指针落盘:current_session_id 已被 backend.run 刷成最新,重启后据此自动接回
         self.sessions.persist(inbound.conv_id)
 
-        # bot 间接力(群聊 + 开启 relay + 平台支持)
+        # bot 间接力(群聊 + 开启 relay + 平台支持):已另发带 <at> 的独立消息 → 撤回流式卡片,只留一条
         if await self.relay.maybe_relay(inbound, resp, self.adapter):
-            await streamer.finalize(override_text="↳ 已 @ 队友接力,内容见下条")
+            await streamer.discard()
         else:
             await streamer.finalize(fallback=resp)
