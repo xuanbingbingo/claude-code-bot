@@ -633,9 +633,10 @@ class ClaudeSession:
         result_text = ""
         raw_tail = ""
         result_is_error = False
+        api_error_status = None
 
         async def _read():
-            nonlocal result_text, raw_tail, result_is_error
+            nonlocal result_text, raw_tail, result_is_error, api_error_status
             history_logged = False
             while True:
                 # 单行读取设静默上限：超过 _STALL_TIMEOUT 没有任何输出＝流卡死
@@ -670,6 +671,7 @@ class ClaudeSession:
                     result_text = event.get("result", "") or result_text
                     if event.get("is_error"):
                         result_is_error = True
+                        api_error_status = event.get("api_error_status")
 
         try:
             try:
@@ -703,11 +705,38 @@ class ClaudeSession:
             self.new_session = True
             return "❌ 该会话内容过大（超过 32MB API 限制），无法恢复。\n已自动切换为新会话模式，请重新发送消息。"
 
-        # resume 的会话历史里有脏数据导致 API 拒绝 → 自动切新会话
-        if result_is_error and "API Error" in (result_text or ""):
+        # 出错处理：务必区分「上游/代理瞬时故障」与「真·会话历史损坏」。
+        # 关键教训——用户的 CLI 走自建推理网关(127.0.0.1:8888 / AntProxy)，
+        # 该网关常抖出 502 upstream unreachable / 503 warming up / 401 auth /
+        # 429 overloaded。这些是**上游临时故障，会话本身完好无损**。
+        # 旧逻辑只要见到 "API Error" 就 new_session=True 把整条会话废掉，
+        # 导致代理一次瞬时抖动就丢光上下文、用户重发变成空白新会话。
+        # 现在：瞬时故障一律**保留会话**，仅在确属会话历史损坏(如 400
+        # invalid_request)时才切新会话。
+        if result_is_error:
+            txt = result_text or ""
+            low = txt.lower()
+            transient = (
+                api_error_status in (408, 409, 425, 429, 500, 502, 503, 504, 529)
+                or "upstream unreachable" in low
+                or "warming up" in low
+                or "overloaded" in low
+                or "server-side issue" in low
+                or "try again" in low
+                or "timeout" in low
+                or "authenticate" in low          # 401：代理鉴权抖动，会话没坏
+                or "authentication" in low
+            )
+            if transient:
+                # 会话完好，绝不丢——保留让用户直接重发接着续上。
+                tag = f"（{api_error_status}）" if api_error_status else ""
+                return (
+                    f"⚠️ 上游/代理临时故障{tag}，本次输出被中断。{_RETRY_NOTE}"
+                )
+            # 走到这里才是真·会话历史损坏，切新会话。
             self.new_session = True
             return (
-                f"⚠️ 恢复会话失败：{result_text}\n\n"
+                f"⚠️ 会话恢复失败：{txt}\n\n"
                 "已自动切换为新会话模式，请重发消息。"
             )
 
