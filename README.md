@@ -34,6 +34,21 @@
 
 ---
 
+## 快速安装（推荐）
+
+克隆后跑一键脚本，自动建 venv、装齐核心依赖、生成 `.env` 模板、检查 Claude CLI：
+
+```bash
+./install.sh                # 飞书 + Telegram 核心依赖
+./install.sh --with-voice   # 额外装语音转写（faster-whisper，收发语音才需要）
+```
+
+装完只剩一件事：编辑 `.env` 填凭证（飞书三项 / Telegram 两项，见下方各渠道说明）。
+
+> 想手动装或只装某个渠道，看下面分渠道步骤；依赖清单也可直接 `pip install -r requirements.txt`。
+
+---
+
 ## 渠道一：飞书（Lark）
 
 飞书渠道用 **长连接（WebSocket）** 模式，本地直接连飞书服务器，**不需要公网地址、nginx、SSH 隧道、ngrok**。
