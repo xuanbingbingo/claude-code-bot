@@ -464,6 +464,21 @@ bash scripts/new-agent.sh researcher cli_xxx secret_yyy ~/.claude/agents/researc
 > 要让新角色在群里 @ 队友协作，再在它的 `.env.<role>` 里加 `BOT_RELAY=1` / `BOT_TEAMMATES`（见 `.env.role.example`）。
 > 企业微信无对应的扫码/API 建应用能力，只能在管理后台手动创建应用后填凭证。
 
+### 在 Claude Code 里一句话建 bot（可选，装 skill）
+
+仓库自带一个 skill（`skills/new-feishu-bot/`），装上后可以直接在 Claude Code 对话里说
+「帮我在飞书加个机器人 叫 XX」，让 Claude 代跑上面的流程、把二维码图打开给你扫，全程不用手敲命令。
+
+```bash
+# 把 skill 拷到 Claude Code 的 skills 目录
+mkdir -p ~/.claude/skills
+cp -r skills/new-feishu-bot ~/.claude/skills/
+```
+
+装好后在 Claude Code 里说一句「用 claude-code-bot 建个飞书机器人」即可触发。skill 会确认角色名/人设 →
+后台跑 `new-agent.sh`（`QR_IMAGE=…` 把二维码存成 PNG）→ 打开图片给你手机飞书扫 → 盯日志确认上线。
+
+
 ---
 
 ## macOS 7×24 部署（防睡眠 + 长任务超时）
