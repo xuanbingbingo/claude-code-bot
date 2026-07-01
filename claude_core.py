@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
@@ -42,6 +43,119 @@ _STALL_MSG = f"⚠️ 模型响应卡住了（{_STALL_TIMEOUT}s 无任何输出�
 
 class _StreamStalled(Exception):
     """流在中途静默超过 _STALL_TIMEOUT，判定卡死。"""
+
+
+@dataclass
+class _RunOutcome:
+    """一次 claude 子进程执行的原始结局；分类与善后统一在 ClaudeSession._settle 做。"""
+    text: str = ""
+    is_error: bool = False
+    api_error_status: int | None = None
+    raw_tail: str = ""
+    stalled: bool = False
+    timed_out: bool = False
+
+
+_TRANSIENT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+
+# 判为「上游/代理瞬时故障」的文本特征（小写匹配）。
+# 关键教训——用户的 CLI 走自建推理网关(127.0.0.1:8888 / AntProxy)，
+# 该网关常抖出 502 upstream unreachable / 503 warming up / 401 auth / 429。
+# 这些是上游临时故障，会话本身完好无损，绝不能因此丢会话。
+_TRANSIENT_MARKERS = (
+    "upstream unreachable", "warming up", "overloaded",
+    "server-side issue", "try again", "timeout",
+    "authenticat",    # 401：代理鉴权抖动，会话没坏（覆盖 authenticate/authentication）
+)
+
+
+def _classify_error(api_error_status: int | None, text: str) -> str:
+    """把一次失败分成 transient（瞬时，保会话）/ fatal（会话历史损坏，才考虑换线）。"""
+    if api_error_status in _TRANSIENT_STATUSES:
+        return "transient"
+    low = (text or "").lower()
+    if any(m in low for m in _TRANSIENT_MARKERS):
+        return "transient"
+    return "fatal"
+
+
+def _heal_session_tail(sid: str) -> None:
+    """自愈被强杀截断的会话 jsonl 尾部。
+
+    超时/卡死杀 claude 进程可能把正在写的最后一行截成半行 JSON，
+    --resume 解析残行会失败，进而把整条会话误判成「历史损坏」丢掉上下文。
+    规则：尾字节是换行 → 完好不动；尾行是完整 JSON 只缺换行 → 补换行；
+    尾行残缺 → 截到最后一个完整行。窗口内找不到行首（单行超大，如图片
+    base64）则宁可不动。
+    """
+    path = _find_session_file(sid)
+    if not path:
+        return
+    try:
+        with open(path, "rb+") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return
+            f.seek(size - 1)
+            if f.read(1) == b"\n":
+                return
+            window = min(size, 8 * 1024 * 1024)
+            f.seek(size - window)
+            tail = f.read(window)
+            nl = tail.rfind(b"\n")
+            if nl < 0 and window < size:
+                return
+            last = tail[nl + 1:]
+            try:
+                json.loads(last.decode("utf-8"))
+                f.write(b"\n")
+                print(f"[WARN] 会话 {sid[:8]} 尾行缺换行，已补全")
+            except Exception:
+                f.truncate(size - len(last))
+                print(f"[WARN] 会话 {sid[:8]} 尾行残缺（疑被强杀截断），已修剪 {len(last)} 字节")
+    except Exception as e:
+        print(f"[WARN] 会话文件自愈失败 {sid[:8]}:{e}")
+
+
+async def _graceful_kill(proc, grace: float = 5.0) -> None:
+    """先 SIGTERM 给 claude 留 flush 会话文件的机会，宽限 grace 秒再 SIGKILL。
+
+    直接 proc.kill() 会把正在写的会话 jsonl 截断成半行，是「超时后会话
+    恢复失败、上下文丢失」的根源之一；任何要杀子进程的路径都必须走这里。
+    等待回收的任何异常（含「Future attached to a different loop」）一律吞掉：
+    信号已发出，进程一定会死。
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            os.kill(proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace)
+        return
+    except asyncio.TimeoutError:
+        pass
+    except Exception:
+        return
+    try:
+        proc.kill()
+    except Exception:
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
+    except Exception:
+        pass
+
 
 _WHISPER_MODEL = None
 
@@ -485,6 +599,10 @@ class ClaudeSession:
         self.new_session = True
         self.resume_session_id = None
         self.current_session_id: str | None = None
+        # 最近一次「成功跑完」的会话 id。失败轮也会刷 current_session_id
+        # （init 事件先于报错到达），恢复失败时靠它回退、重启续接也优先
+        # 持久化它（见 resumable_session_id），避免指针停在残缺会话上。
+        self.last_good_session_id: str | None = None
         self.last_cwd_listing: list[str] = []
         self.model: str | None = None  # None = 用 Claude CLI 默认
         self.mode: str = "bypass"
@@ -501,30 +619,52 @@ class ClaudeSession:
         self.new_session = True
         self.resume_session_id = None
         self.current_session_id = None
+        # 换线就不该再回退到旧线：否则新会话首轮一失败，兜底逻辑会把
+        # 上一段无关对话的上下文诈尸回来。
+        self.last_good_session_id = None
 
     def set_resume_session(self, session_id: str | None):
         self.resume_session_id = session_id
         self.new_session = False
         self.current_session_id = session_id
+        # 用户/恢复逻辑显式选中的会话即视为完好基线
+        self.last_good_session_id = session_id
 
     def set_cwd(self, new_cwd: str) -> None:
         """切换工作目录，默认开新会话（要接旧会话用 /resume）"""
         self.cwd = new_cwd
         self.set_new_session()
 
+    @property
+    def resumable_session_id(self) -> str | None:
+        """重启续接该落盘的 id：当前指针的 jsonl 还在就用它，否则回退最近成功会话。
+        SessionManager.persist 优先取它，保证落盘的指针永远指向可恢复的记录。"""
+        for sid in (self.current_session_id, self.last_good_session_id):
+            if sid and _session_file_exists(sid):
+                return sid
+        return None
+
     def build_session_flags(self) -> list[str]:
+        # 显式 /resume <sid> 优先（来自用户命令或重启恢复）
         if self.resume_session_id:
+            _heal_session_tail(self.resume_session_id)
             return ["--resume", self.resume_session_id]
-        # 钉死本网关自己那条会话：用 --resume <current_session_id>，
-        # 而不是 --continue。--continue 接的是「工作目录里最近活跃的会话」，
-        # 由于飞书网关与 CLI 共用同一个 cwd（~/aiProjects）的会话池，
-        # 在 CLI 聊过之后再发飞书，--continue 会串到 CLI 的会话上。
-        # 改为 --resume 自己的 session id 后，飞书永远只接它自己的线；
-        # 主动 /resume <编号> 仍走上面 resume_session_id 分支，可跳到任意 CLI 会话。
-        if not self.new_session and self.current_session_id:
-            return ["--resume", self.current_session_id]
-        if not self.new_session:
-            return ["--continue"]
+        if self.new_session:
+            return []
+        # 钉死本网关自己那条会话：用 --resume <sid>，绝不用 --continue。
+        # --continue 接的是「工作目录里最近活跃的会话」，飞书网关与 CLI 共用
+        # 同一个 cwd（~/aiProjects）的会话池，--continue 会串到 CLI 的会话上。
+        # 优先当前指针；其 jsonl 不在（上轮被杀/被清）则回退最近一次成功会话。
+        for sid in (self.current_session_id, self.last_good_session_id):
+            if not sid or not _session_file_exists(sid):
+                continue
+            if sid != self.current_session_id:
+                print(f"[WARN] 会话 {(self.current_session_id or '?')[:8]} 记录不在，回退上一完好会话 {sid[:8]}")
+                self.current_session_id = sid
+            _heal_session_tail(sid)
+            return ["--resume", sid]
+        if self.current_session_id or self.last_good_session_id:
+            print("[WARN] 无可恢复的会话记录，本轮开新会话")
         return []
 
     def _spawn_env(self) -> dict:
@@ -562,82 +702,39 @@ class ClaudeSession:
     async def stop(self) -> bool:
         """终止当前运行中的 Claude 子进程，返回是否实际杀掉了东西。
 
-        加固：杀进程信号必发（不依赖事件循环，跨线程/跨 loop 也生效）；
-        等待回收的任何异常（含「Future attached to a different loop」）一律吞掉，
-        保证 /stop 永远干净返回——进程信号已发出，任务一定会被杀。
+        走 _graceful_kill：先 SIGTERM 留给 claude flush 会话文件的机会，
+        宽限后才 SIGKILL；跨 loop 等待异常一律吞掉，/stop 永远干净返回。
         """
         proc = self.current_proc
         if proc is None or proc.returncode is not None:
             return False
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return False
-        except Exception:
-            try:
-                os.kill(proc.pid, signal.SIGTERM)
-            except Exception:
-                pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                try:
-                    os.kill(proc.pid, signal.SIGKILL)
-                except Exception:
-                    pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except Exception:
-                pass
-        except Exception:
-            # 跨 loop 等待异常：信号已发出，忽略
-            pass
+        await _graceful_kill(proc, grace=2.0)
         return True
 
-    async def run_claude(self, prompt: str, streamer=None) -> str:
-        print(f"\n{'─' * 60}")
-        print(f"📱  {prompt}")
-        print(f"{'─' * 60}\n")
-        sys.stdout.flush()
+    async def _execute(self, cmd: list[str], history_prompt: str, streamer,
+                       stdin_payload: bytes | None = None) -> _RunOutcome:
+        """跑一次 claude 子进程、泵事件流，返回原始结局（分类善后见 _settle）。
 
-        await self.stop()
-        session_flags = self.build_session_flags()
-        cmd = (
-            self._build_cmd_prefix()
-            + session_flags
-            + [
-                "--output-format", "stream-json",
-            ]
-            + _PARTIAL_FLAG
-            + [
-                "--verbose",
-                "-p", prompt,
-            ]
-        )
-        self.new_session = False
-        self.resume_session_id = None  # 用一次后清掉，后续靠 --continue
-
+        文本与图片两条路径共用这一个引擎——历史教训：两份复制粘贴的执行
+        循环让错误处理只修了文本路径，图片路径同类 bug 原样复发。
+        """
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if stdin_payload else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.cwd,
             env=self._spawn_env(),
         )
         self.current_proc = proc
+        out = _RunOutcome()
 
-        result_text = ""
-        raw_tail = ""
-        result_is_error = False
-        api_error_status = None
-
-        async def _read():
-            nonlocal result_text, raw_tail, result_is_error, api_error_status
+        async def _pump():
             history_logged = False
+            if stdin_payload:
+                proc.stdin.write(stdin_payload)
+                await proc.stdin.drain()
+                proc.stdin.close()
             while True:
                 # 单行读取设静默上限：超过 _STALL_TIMEOUT 没有任何输出＝流卡死
                 try:
@@ -649,7 +746,7 @@ class ClaudeSession:
                 if not line:
                     break  # EOF，进程正常结束
                 decoded = line.decode("utf-8", errors="replace")
-                raw_tail = (raw_tail + decoded)[-4096:]
+                out.raw_tail = (out.raw_tail + decoded)[-4096:]
                 print(decoded, end="", flush=True)
                 s = decoded.strip()
                 if not s:
@@ -663,84 +760,106 @@ class ClaudeSession:
                     if sid:
                         self.current_session_id = sid
                         if not history_logged:
-                            append_history_entry(prompt, self.cwd, sid)
-                            ensure_session_title(sid, prompt)
+                            append_history_entry(history_prompt, self.cwd, sid)
+                            ensure_session_title(sid, history_prompt)
                             history_logged = True
                 await _dispatch_event(event, streamer)
                 if event.get("type") == "result":
-                    result_text = event.get("result", "") or result_text
+                    out.text = event.get("result", "") or out.text
                     if event.get("is_error"):
-                        result_is_error = True
-                        api_error_status = event.get("api_error_status")
+                        out.is_error = True
+                        out.api_error_status = event.get("api_error_status")
 
         try:
             try:
-                await asyncio.wait_for(_read(), timeout=_RUN_TIMEOUT)
+                await asyncio.wait_for(_pump(), timeout=_RUN_TIMEOUT)
                 await proc.wait()
             except _StreamStalled:
-                proc.kill()
-                await proc.wait()
-                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断，会话保留")
-                if streamer:
-                    await streamer.clear_status()
-                    if getattr(streamer, "has_content", False):
-                        await streamer.append(f"\n\n{_STALL_MSG}")
-                return _STALL_MSG
+                await _graceful_kill(proc)
+                out.stalled = True
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                print("\n⏰ 执行超时")
-                if streamer:
-                    await streamer.clear_status()
-                    if getattr(streamer, "has_content", False):
-                        await streamer.append(f"\n\n{_RUN_TIMEOUT_MSG}")
-                return _RUN_TIMEOUT_MSG
+                await _graceful_kill(proc)
+                out.timed_out = True
         finally:
             if self.current_proc is proc:
                 self.current_proc = None
+        return out
+
+    async def _settle(self, out: _RunOutcome, streamer) -> str:
+        """统一善后：超时/卡死/错误分类/指针提升，任何执行路径都不许绕过。
+
+        核心原则：区分「上游/代理瞬时故障」与「真·会话历史损坏」。
+        瞬时故障（5xx/429/408/401/upstream unreachable/warming up 等）
+        一律保留会话让用户重发续上；真损坏也先回退最近成功会话，
+        回退不了才开新——「一出错就核爆整条会话」正是丢上下文 bug 的老根。
+        """
+        async def _notify(msg: str):
+            # 异常结局要让用户在卡片上看到，不能只藏在返回值里
+            # （streamer 已有内容时 finalize 的 fallback 会被忽略）。
+            if streamer:
+                await streamer.clear_status()
+                if getattr(streamer, "has_content", False):
+                    await streamer.append(f"\n\n{msg}")
+
+        if out.stalled:
+            print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断，会话保留")
+            await _notify(_STALL_MSG)
+            return _STALL_MSG
+        if out.timed_out:
+            print("\n⏰ 执行超时（会话保留）")
+            await _notify(_RUN_TIMEOUT_MSG)
+            return _RUN_TIMEOUT_MSG
 
         print(f"\n{'─' * 60}")
 
-        if "Request too large" in raw_tail or "max 32MB" in raw_tail:
-            self.new_session = True
-            return "❌ 该会话内容过大（超过 32MB API 限制），无法恢复。\n已自动切换为新会话模式，请重新发送消息。"
+        if "Request too large" in out.raw_tail or "max 32MB" in out.raw_tail:
+            self.set_new_session()
+            return ("❌ 该会话内容过大（超过 32MB API 限制），无法恢复。\n"
+                    "已自动切换为新会话模式，请重新发送消息。")
 
-        # 出错处理：务必区分「上游/代理瞬时故障」与「真·会话历史损坏」。
-        # 关键教训——用户的 CLI 走自建推理网关(127.0.0.1:8888 / AntProxy)，
-        # 该网关常抖出 502 upstream unreachable / 503 warming up / 401 auth /
-        # 429 overloaded。这些是**上游临时故障，会话本身完好无损**。
-        # 旧逻辑只要见到 "API Error" 就 new_session=True 把整条会话废掉，
-        # 导致代理一次瞬时抖动就丢光上下文、用户重发变成空白新会话。
-        # 现在：瞬时故障一律**保留会话**，仅在确属会话历史损坏(如 400
-        # invalid_request)时才切新会话。
-        if result_is_error:
-            txt = result_text or ""
-            low = txt.lower()
-            transient = (
-                api_error_status in (408, 409, 425, 429, 500, 502, 503, 504, 529)
-                or "upstream unreachable" in low
-                or "warming up" in low
-                or "overloaded" in low
-                or "server-side issue" in low
-                or "try again" in low
-                or "timeout" in low
-                or "authenticate" in low          # 401：代理鉴权抖动，会话没坏
-                or "authentication" in low
-            )
-            if transient:
-                # 会话完好，绝不丢——保留让用户直接重发接着续上。
-                tag = f"（{api_error_status}）" if api_error_status else ""
-                return (
-                    f"⚠️ 上游/代理临时故障{tag}，本次输出被中断。{_RETRY_NOTE}"
-                )
-            # 走到这里才是真·会话历史损坏，切新会话。
-            self.new_session = True
-            return (
-                f"⚠️ 会话恢复失败：{txt}\n\n"
-                "已自动切换为新会话模式，请重发消息。"
-            )
+        if out.is_error:
+            if _classify_error(out.api_error_status, out.text) == "transient":
+                tag = f"（{out.api_error_status}）" if out.api_error_status else ""
+                msg = f"⚠️ 上游/代理临时故障{tag}，本次输出被中断。{_RETRY_NOTE}"
+                await _notify(msg)
+                return msg
+            dead = self.current_session_id
+            fb = self.last_good_session_id
+            if fb and fb != dead and _session_file_exists(fb):
+                self.set_resume_session(fb)
+                msg = (f"⚠️ 会话恢复失败：{out.text}\n\n"
+                       f"已自动回退到上一个完好会话（{fb[:8]}…），直接重发消息即可接着继续。")
+                await _notify(msg)
+                return msg
+            self.set_new_session()
+            msg = f"⚠️ 会话恢复失败：{out.text}\n\n已自动切换为新会话模式，请重发消息。"
+            await _notify(msg)
+            return msg
 
-        return (result_text or "").strip()
+        # 成功：提升「最近成功会话」，供失败回退与重启续接兜底
+        if self.current_session_id:
+            self.last_good_session_id = self.current_session_id
+        return (out.text or "").strip()
+
+    async def run_claude(self, prompt: str, streamer=None) -> str:
+        print(f"\n{'─' * 60}")
+        print(f"📱  {prompt}")
+        print(f"{'─' * 60}\n")
+        sys.stdout.flush()
+
+        await self.stop()
+        cmd = (
+            self._build_cmd_prefix()
+            + self.build_session_flags()
+            + ["--output-format", "stream-json"]
+            + _PARTIAL_FLAG
+            + ["--verbose", "-p", prompt]
+        )
+        self.new_session = False
+        self.resume_session_id = None  # 用一次即清，后续钉住 current_session_id 续接
+
+        out = await self._execute(cmd, prompt, streamer)
+        return await self._settle(out, streamer)
 
     async def run_claude_with_image(self, image_path: str, caption: str, streamer=None) -> str:
         prompt_text = caption or "请描述这张图片的内容"
@@ -764,98 +883,18 @@ class ClaudeSession:
                 {"type": "text", "text": prompt_text},
             ],
         }
-        stdin_payload = json.dumps({"type": "user", "message": message}) + "\n"
+        stdin_payload = (json.dumps({"type": "user", "message": message}) + "\n").encode()
 
         await self.stop()
-        session_flags = self.build_session_flags()
         cmd = (
             self._build_cmd_prefix()
-            + session_flags
-            + [
-                "-p",
-                "--input-format", "stream-json",
-                "--output-format", "stream-json",
-            ]
+            + self.build_session_flags()
+            + ["-p", "--input-format", "stream-json", "--output-format", "stream-json"]
             + _PARTIAL_FLAG
-            + [
-                "--verbose",
-            ]
+            + ["--verbose"]
         )
         self.new_session = False
         self.resume_session_id = None
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=self.cwd,
-            env=self._spawn_env(),
-        )
-        self.current_proc = proc
-
-        result_text = ""
-
-        async def _stream():
-            nonlocal result_text
-            proc.stdin.write(stdin_payload.encode())
-            await proc.stdin.drain()
-            proc.stdin.close()
-            history_logged = False
-            while True:
-                try:
-                    line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=_STALL_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    raise _StreamStalled()
-                if not line:
-                    break
-                decoded = line.decode("utf-8", errors="replace")
-                print(decoded, end="", flush=True)
-                s = decoded.strip()
-                if not s:
-                    continue
-                try:
-                    event = json.loads(s)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "system" and event.get("subtype") == "init":
-                    sid = event.get("session_id")
-                    if sid:
-                        self.current_session_id = sid
-                        if not history_logged:
-                            append_history_entry(prompt_text, self.cwd, sid)
-                            ensure_session_title(sid, prompt_text)
-                            history_logged = True
-                await _dispatch_event(event, streamer)
-                if event.get("type") == "result":
-                    result_text = event.get("result", "") or result_text
-
-        try:
-            try:
-                await asyncio.wait_for(_stream(), timeout=_RUN_TIMEOUT)
-                await proc.wait()
-            except _StreamStalled:
-                proc.kill()
-                await proc.wait()
-                print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断，会话保留")
-                if streamer:
-                    await streamer.clear_status()
-                    if getattr(streamer, "has_content", False):
-                        await streamer.append(f"\n\n{_STALL_MSG}")
-                return _STALL_MSG
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                if streamer:
-                    await streamer.clear_status()
-                    if getattr(streamer, "has_content", False):
-                        await streamer.append(f"\n\n{_RUN_TIMEOUT_MSG}")
-                return _RUN_TIMEOUT_MSG
-        finally:
-            if self.current_proc is proc:
-                self.current_proc = None
-
-        print(f"\n{'─' * 60}")
-        return (result_text or "").strip()
+        out = await self._execute(cmd, prompt_text, streamer, stdin_payload=stdin_payload)
+        return await self._settle(out, streamer)

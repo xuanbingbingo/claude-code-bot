@@ -41,9 +41,10 @@ class Gateway:
         except Exception as e:
             await streamer.finalize(fallback=f"❌ 出错了：{e}")
             return
-
-        # 本轮会话指针落盘:current_session_id 已被 backend.run 刷成最新,重启后据此自动接回
-        self.sessions.persist(inbound.conv_id)
+        finally:
+            # 本轮会话指针落盘:成功失败都落——异常路径往往也已拿到新 session_id,
+            # 不落盘的话进程一重启就接不回,正是「bot 突然失忆」的来源之一
+            self.sessions.persist(inbound.conv_id)
 
         # bot 间接力(群聊 + 开启 relay + 平台支持):已另发带 <at> 的独立消息 → 撤回流式卡片,只留一条
         if await self.relay.maybe_relay(inbound, resp, self.adapter):

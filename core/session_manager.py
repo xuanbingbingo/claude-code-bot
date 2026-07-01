@@ -47,7 +47,12 @@ class SessionManager:
         if not self._state_file or not conv_id:
             return
         backend = self._backends.get(conv_id)
-        sid = getattr(backend, "current_session_id", None) if backend else None
+        # 优先 resumable_session_id(其 jsonl 保证还在磁盘):失败轮会把
+        # current_session_id 推到残缺会话上,直接落盘它重启就接不回了
+        sid = None
+        if backend:
+            sid = (getattr(backend, "resumable_session_id", None)
+                   or getattr(backend, "current_session_id", None))
         with self._lock:
             if sid:
                 if self._pointers.get(conv_id) == sid:

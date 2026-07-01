@@ -80,6 +80,10 @@ class ClaudeCodeBackend(AgentBackend):
     def current_session_id(self):
         return self.session.current_session_id
 
+    @property
+    def resumable_session_id(self):
+        return self.session.resumable_session_id
+
     def status_lines(self) -> list[str]:
         s = self.session
         running = s.current_proc is not None and s.current_proc.returncode is None
