@@ -7,7 +7,7 @@ httpx>=0.28                 # 飞书 REST API 调用（两个渠道都用到）
 lark-oapi>=1.6              # 飞书开放平台 SDK —— 飞书渠道必需
 python-telegram-bot>=22     # Telegram SDK —— Telegram 渠道必需
 websockets>=15              # 飞书长连接事件订阅
-qrcode>=7.4                 # 扫码建应用：终端二维码渲染（new-agent.sh 无凭证时）
+qrcode[pil]>=7.4            # 扫码建应用：终端二维码 + PNG（skill 代跑时 open 给用户扫）
 
 # ── 可选：语音消息转写 ──────────────────────────────
 # 只有需要收/发语音消息时才用；首次运行会自动下载 Whisper 模型（约 150MB）。

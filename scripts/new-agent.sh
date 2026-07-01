@@ -43,7 +43,9 @@ else
     echo "🔨 未提供 App ID/Secret，启动扫码建应用（手机飞书扫码）..."
     # 优先用仓库 venv 的 python（httpx/qrcode 装在这儿），没有再退系统 python3
     PYBIN="$REPO/venv/bin/python"; [ -x "$PYBIN" ] || PYBIN="python3"
-    CREDS="$("$PYBIN" "$REPO/scripts/feishu_setup.py" --role "$ROLE")" || {
+    # 设了 QR_IMAGE 环境变量则把二维码另存 PNG（供 skill/Claude 代跑时 open 给用户扫）
+    QR_ARG=""; [ -n "${QR_IMAGE:-}" ] && QR_ARG="--qr-image ${QR_IMAGE}"
+    CREDS="$("$PYBIN" "$REPO/scripts/feishu_setup.py" --role "$ROLE" $QR_ARG)" || {
         echo "❌ 扫码建应用失败或取消，已中止。"; exit 1
     }
     read -r APP_ID APP_SECRET OWNER_OPEN_ID <<< "$CREDS"

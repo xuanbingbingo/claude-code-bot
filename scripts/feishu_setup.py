@@ -53,22 +53,39 @@ def _call(client: httpx.Client, base: str, action: str, extra: dict) -> dict:
         raise RuntimeError(f"注册端点返回非 JSON（HTTP {resp.status_code}）：{resp.text[:200]}")
 
 
-def _show_qr(url: str):
-    """把 verification URL 渲染成终端 ASCII 二维码（打到 stderr），并打印原始 URL 兜底。"""
-    try:
-        import qrcode
+def _show_qr(url: str, qr_image: str = ""):
+    """
+    展示扫码链接的二维码。
+    - 默认渲染成终端 ASCII 二维码（打到 stderr）——适合用户自己在终端敲命令的场景。
+    - 若给了 qr_image 路径，则额外存一张 PNG（需 pillow）——适合 skill / Claude 代跑的场景，
+      由上层 open 这张图给用户扫（终端 ASCII 在代跑时用户看不到）。
+    无论哪种都打印原始 URL 兜底。
+    """
+    saved_png = False
+    if qr_image:
+        try:
+            import qrcode
 
-        qr = qrcode.QRCode(border=1)
-        qr.add_data(url)
-        qr.make(fit=True)
-        qr.print_ascii(out=sys.stderr, invert=True)
-    except Exception as e:  # noqa: BLE001
-        eprint(f"（终端二维码渲染失败：{e}，请用下面的链接手动打开/扫码）")
-    eprint("\n用【手机飞书】扫上面的二维码，或在飞书里打开这个链接授权：")
+            qrcode.make(url).save(qr_image)  # qrcode.make 走 PIL image，需 pillow
+            saved_png = True
+            eprint(f"🖼  二维码已存为图片：{qr_image}")
+        except Exception as e:  # noqa: BLE001
+            eprint(f"（PNG 二维码生成失败：{e}，回退终端二维码）")
+    if not saved_png:
+        try:
+            import qrcode
+
+            qr = qrcode.QRCode(border=1)
+            qr.add_data(url)
+            qr.make(fit=True)
+            qr.print_ascii(out=sys.stderr, invert=True)
+        except Exception as e:  # noqa: BLE001
+            eprint(f"（终端二维码渲染失败：{e}，请用下面的链接手动打开/扫码）")
+    eprint("\n用【手机飞书】扫二维码，或在飞书里打开这个链接授权：")
     eprint(f"  {url}\n")
 
 
-def run_registration(platform: str = "feishu", timeout: int = 600, role: str = "") -> dict:
+def run_registration(platform: str = "feishu", timeout: int = 600, role: str = "", qr_image: str = "") -> dict:
     """执行完整设备码注册流，成功返回 {app_id, app_secret, open_id, platform}。"""
     base = LARK_BASE if platform == "lark" else FEISHU_BASE
     tag = f"[{role}] " if role else ""
@@ -111,7 +128,7 @@ def run_registration(platform: str = "feishu", timeout: int = 600, role: str = "
         expire_in = begin_res.get("expires_in") or begin_res.get("expire_in") or timeout
         deadline = time.time() + min(expire_in, timeout)
 
-        _show_qr(verify_uri)
+        _show_qr(verify_uri, qr_image)
         user_code = begin_res.get("user_code")
         if user_code:
             eprint(f"{tag}   （如页面要求手输配对码：{user_code}）")
@@ -163,10 +180,13 @@ def main():
     parser.add_argument("--role", default="", help="角色名，仅用于提示显示")
     parser.add_argument("--platform", default="feishu", choices=["feishu", "lark"], help="默认 feishu，poll 时自动切")
     parser.add_argument("--timeout", type=int, default=600, help="等待授权超时（秒），默认 600")
+    parser.add_argument("--qr-image", default="", help="把二维码额外存成 PNG（需 pillow），供代跑时 open 给用户扫")
     args = parser.parse_args()
 
     try:
-        result = run_registration(platform=args.platform, timeout=args.timeout, role=args.role)
+        result = run_registration(
+            platform=args.platform, timeout=args.timeout, role=args.role, qr_image=args.qr_image
+        )
     except KeyboardInterrupt:
         eprint("\n已取消。")
         sys.exit(130)
