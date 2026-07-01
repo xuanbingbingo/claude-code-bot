@@ -29,10 +29,12 @@ def main():
     adapter = make_adapter(config.platform, config)
     relay = RelayManager(config.relay_enabled, config.relay_max_hops, config.relay_teammates)
 
-    # backend 的 append-system-prompt = 人设 + relay 队友提示 + 平台工具提示(飞书 send-file)
-    append_prompt = "\n\n".join(p for p in (config.persona, relay.system_prompt(), adapter.tool_prompt()) if p)
-
-    def backend_factory():
+    # backend 的 append-system-prompt = 人设 + 平台工具提示(飞书 send-file);
+    # relay 队友提示仅群聊 backend 注入 —— 单聊没有队友,注入只会逼 bot 每轮对空气 @ 队友(纯噪音)。
+    # conv_id 与会话类型稳定绑定(群 chat_id 恒群、单聊 chat_id 恒单聊),故按会话建 backend 时定死即可。
+    def backend_factory(is_group: bool = False):
+        relay_prompt = relay.system_prompt() if is_group else ""
+        append_prompt = "\n\n".join(p for p in (config.persona, relay_prompt, adapter.tool_prompt()) if p)
         return make_backend(config.backend, cwd=config.cwd, append_prompt=append_prompt)
 
     # state_key 按平台取 bot 唯一标识(飞书 app_id / 企微 bot_id / TG botid),用于跨重启会话续接落盘

@@ -110,7 +110,9 @@ class FeishuAdapter(PlatformAdapter):
             mentions.append({"name": getattr(m, "name", "") or "",
                              "open_id": getattr(mid, "open_id", "") if mid else "",
                              "key": getattr(m, "key", "") or ""})
-        if chat_id:
+        # 名册仅群聊维护:relay 接力只在群里发生(maybe_relay 判 is_group),
+        # 单聊 conv_id=发送者 open_id≠chat_id,即便 harvest 也永不被查 → 只群聊 harvest,保持单聊/群聊隔离。
+        if ctype == "group" and chat_id:
             self.relay.harvest(chat_id, mentions)
 
         text, images = "", []

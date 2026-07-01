@@ -66,9 +66,12 @@ class SessionManager:
                 print(f"[WARN] 持久化会话指针失败:{e}")
 
     # ---- 会话隔离 ----
-    def get_or_create(self, conv_id: str):
+    def get_or_create(self, conv_id: str, is_group: bool = False):
+        # is_group 用于让 factory 决定是否注入群聊专属提示(如 relay 队友)。
+        # 依赖不变式:conv_id 与会话类型稳定绑定(群 chat_id 恒群、单聊 open_id 恒单聊),
+        # 故 backend 首建时按 is_group 定死人设即可,不会中途变类型。
         if conv_id not in self._backends:
-            backend = self._factory()
+            backend = self._factory(is_group)
             # 重启恢复:该会话若有持久化指针且其 jsonl 仍在磁盘,自动接回重启前的会话;
             # jsonl 已删则照常开新会话(set_resume_session 不被调用)。后端不支持会话
             # (session_file_exists 默认 False,如 Hermes)时该分支天然跳过。
