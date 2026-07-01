@@ -439,18 +439,30 @@ bash start-bot.sh research              # 以「research 角色」启动；日�
 
 ### 一键创建新角色 bot（推荐）
 
-`scripts/new-agent.sh` 把上面的本地步骤（生成 `.env.<role>` + launchd 自启 + 启动）合成一条命令：
+`scripts/new-agent.sh` 把本地步骤（生成 `.env.<role>` + launchd 自启 + 启动）合成一条命令。建飞书应用有两种方式：
+
+**方式一：扫码自动建应用（推荐，免手动进开放平台）**
 
 ```bash
-# 先在飞书开放平台为该角色建一个企业自建应用并发布，拿到 App ID/Secret，然后：
+# 不传 App ID/Secret：脚本弹出二维码，手机飞书扫码即自动建好应用并拿到凭证
+bash scripts/new-agent.sh researcher ~/.claude/agents/researcher.md 研究员
+```
+
+扫码走的是飞书账号中心的设备码注册流（`accounts.feishu.cn/oauth/v1/app/registration`，`PersonalAgent` 模板），扫码授权后**自动创建自建应用并预配机器人能力/权限/事件订阅**，直接返回 App ID/Secret。也可单独跑 `python3 scripts/feishu_setup.py --role researcher` 只拿凭证。
+
+> 扫码页会显示飞书 OpenClaw 生态的注册模板文案（这套端点飞书也给 lark-cli 用），不影响拿到凭证。该端点非飞书 server-docs 公开承诺稳定的 API，若某天失效可退回方式二手动建。
+
+**方式二：手动填凭证（已在开放平台建好应用的）**
+
+```bash
 bash scripts/new-agent.sh researcher cli_xxx secret_yyy ~/.claude/agents/researcher.md 研究员
 ```
 
-它会：① 生成 `.env.researcher` ② 生成 launchd 自启配置 ③ 启动 bot。
+两种方式都会：① 生成 `.env.researcher` ② 生成 launchd 自启配置 ③ 启动 bot。
 人设文件用 [Claude Code 子代理格式](agents-example/role.md)（frontmatter + 正文＝角色系统提示），模板见 `agents-example/role.md`。
 
-> 唯一不能自动的是「在飞书开放平台建应用拿 App ID/Secret」——飞书不开放用 API 建应用，这步要你在网页完成。
 > 要让新角色在群里 @ 队友协作，再在它的 `.env.<role>` 里加 `BOT_RELAY=1` / `BOT_TEAMMATES`（见 `.env.role.example`）。
+> 企业微信无对应的扫码/API 建应用能力，只能在管理后台手动创建应用后填凭证。
 
 ---
 
