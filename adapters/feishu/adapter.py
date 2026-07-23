@@ -1,7 +1,7 @@
 """FeishuAdapter —— 飞书 lark_oapi WsClient 长连接适配器。
 WsClient.start() 同步阻塞 → 跑在 to_thread;消息事件在 lark sdk 线程触发,解析成
 InboundMessage 后用 run_coroutine_threadsafe 投递到主 loop 的 gateway.handle。
-支持 text / image / audio / post;名册与 @ 接力委托 FeishuRelay。
+支持 text / image / audio / post / file / media(文件落到 inbox/ 后以路径注入文本);名册与 @ 接力委托 FeishuRelay。
 """
 import asyncio
 import json
@@ -129,6 +129,16 @@ class FeishuAdapter(PlatformAdapter):
                 images.append(p)
         elif msg_type == "audio":
             text = self._transcribe(message_id, content.get("file_key", ""))
+        elif msg_type in ("file", "media"):
+            name = os.path.basename(content.get("file_name", "") or "未命名文件")
+            inbox = os.path.join(_ROOT, "inbox")
+            os.makedirs(inbox, exist_ok=True)
+            dst = os.path.join(inbox, f"{message_id[-8:]}_{name}")
+            if content.get("file_key") and self.api.download_resource(
+                    message_id, content["file_key"], "file", dst):
+                text = f"[用户通过飞书发来文件,已保存到 {dst}]"
+            else:
+                text = f"[用户通过飞书发来文件「{name}」,但下载失败,请告知用户重发]"
         else:
             return None
 
