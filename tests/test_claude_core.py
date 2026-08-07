@@ -282,3 +282,59 @@ class TestMetaSlashCommand:
     @pytest.mark.parametrize("p", ["/goal 出30篇选题", "普通消息", "/deep-research xx"])
     def test_not_meta(self, p):
         assert cc._is_meta_slash_command(p) is False
+
+
+# ---------- 工具执行期间的静默分级（长任务被误杀的根因） ----------
+
+class TestToolDelta:
+    """_tool_delta 决定静默看门狗用哪把尺子；数错就会把跑视频的 Bash 当成流卡死砍掉。"""
+
+    def _assistant(self, *types):
+        return {"type": "assistant", "message": {"content": [{"type": t} for t in types]}}
+
+    def _user(self, *types):
+        return {"type": "user", "message": {"content": [{"type": t} for t in types]}}
+
+    def test_tool_use_increments(self):
+        assert cc._tool_delta(self._assistant("text", "tool_use")) == 1
+
+    def test_parallel_tool_use_counts_each(self):
+        assert cc._tool_delta(self._assistant("tool_use", "tool_use", "tool_use")) == 3
+
+    def test_tool_result_decrements(self):
+        assert cc._tool_delta(self._user("tool_result")) == -1
+
+    def test_plain_text_turn_is_neutral(self):
+        assert cc._tool_delta(self._assistant("text")) == 0
+        assert cc._tool_delta(self._user("text")) == 0
+
+    def test_stream_events_ignored(self):
+        # stream_event 是同一次 tool_use 的逐块增量，按它计数会把一个工具重复加好几次
+        ev = {"type": "stream_event",
+              "event": {"type": "content_block_start",
+                        "content_block": {"type": "tool_use", "id": "x"}}}
+        assert cc._tool_delta(ev) == 0
+
+    def test_malformed_content_is_safe(self):
+        assert cc._tool_delta({"type": "assistant"}) == 0
+        assert cc._tool_delta({"type": "assistant", "message": {"content": "文本"}}) == 0
+        assert cc._tool_delta({"type": "assistant", "message": {"content": [None, "x"]}}) == 0
+
+    def test_balanced_sequence_returns_to_zero(self):
+        seq = [self._assistant("tool_use"), self._user("tool_result"),
+               self._assistant("tool_use", "tool_use"),
+               self._user("tool_result"), self._user("tool_result")]
+        assert sum(cc._tool_delta(e) for e in seq) == 0
+
+    def test_tool_window_is_longer_than_api_window(self):
+        # 工具窗口必须 >= API 窗口，否则分级毫无意义
+        assert cc._TOOL_STALL_TIMEOUT >= cc._STALL_TIMEOUT
+
+
+class TestStreamStalledFlag:
+    def test_carries_in_tool(self):
+        assert cc._StreamStalled(in_tool=True).in_tool is True
+        assert cc._StreamStalled().in_tool is False
+
+    def test_outcome_defaults(self):
+        assert cc._RunOutcome().stalled_in_tool is False

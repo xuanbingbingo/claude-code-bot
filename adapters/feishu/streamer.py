@@ -6,7 +6,7 @@ import asyncio
 
 from core.streamer import StreamerBase
 
-BUDGET = 25000
+BUDGET = 24900          # 飞书单卡片 25KB;留 100B 给 _flush 追加的心跳提示
 
 
 def _blen(s: str) -> int:
@@ -42,7 +42,7 @@ class FeishuStreamer(StreamerBase):
             parts.append(text if text.startswith("💬") else f"💬 {text}")
         if self.current_status and not self.has_content:
             parts.append(self.current_status)
-        return "\n\n".join(parts) if parts else "⏳ 处理中..."
+        return "\n\n".join(parts) if parts else self.PLACEHOLDER
 
     def _render(self) -> str:
         full = self._assemble(0, self.text)
@@ -68,6 +68,7 @@ class FeishuStreamer(StreamerBase):
         """接力已另发带 <at> 的独立消息 → 撤回本条流式卡片,群里只剩那条能 @ 到人的消息。
         撤回失败(无 id / 接口报错)则退化为收尾提示,绝不把卡片留在流式中间态。"""
         self._finalized = True
+        self._stop_heartbeat()
         if self._pending and not self._pending.done():
             self._pending.cancel()
         if self.message_id and await asyncio.to_thread(self.api.delete_message, self.message_id):

@@ -30,6 +30,13 @@ _RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_TIMEOUT // 60} 分钟）。
 # 立即中断而不是干等总超时。可用 CLAUDE_STALL_TIMEOUT 覆盖。
 _STALL_TIMEOUT = int(os.environ.get("CLAUDE_STALL_TIMEOUT", "180"))
 
+# ⚠️ 分级：工具执行期间流上本来就没有任何事件（Bash 在跑视频渲染/大下载时可以静默好几
+# 分钟），拿等 API 的 180s 去卡它属于误杀——历史上 gen-video 就是这么被砍的。
+# 已发出 tool_use 但还没收到 tool_result 时改用这把更长的尺子；等 API 仍用短的，
+# 真·流中断依旧能被快速发现。可用 CLAUDE_TOOL_STALL_TIMEOUT 覆盖。
+_TOOL_STALL_TIMEOUT = max(_STALL_TIMEOUT,
+                          int(os.environ.get("CLAUDE_TOOL_STALL_TIMEOUT", "900")))
+
 # 逐 token 流式开关，默认开（飞书要像 CLI 一样实时流式）。
 # 可用 CLAUDE_PARTIAL_MESSAGES=0 关闭。
 _PARTIAL_FLAG = (["--include-partial-messages"]
@@ -39,10 +46,16 @@ _PARTIAL_FLAG = (["--include-partial-messages"]
 # 给一个上限让响应保持迅捷；可用 CLAUDE_MAX_THINKING 调整，设 "0" 取消上限。
 _MAX_THINKING = os.environ.get("CLAUDE_MAX_THINKING", "8000").strip()
 _STALL_MSG = f"⚠️ 模型响应卡住了（{_STALL_TIMEOUT}s 无任何输出），已中断。多半是 API 流中断。{_RETRY_NOTE}"
+_TOOL_STALL_MSG = (f"⚠️ 某个工具跑了 {_TOOL_STALL_TIMEOUT // 60} 分钟还没吭声，已中断。"
+                   f"长任务请让我用 detach-run 甩到后台，别在对话里干等。{_RETRY_NOTE}")
 
 
 class _StreamStalled(Exception):
-    """流在中途静默超过 _STALL_TIMEOUT，判定卡死。"""
+    """流静默超时。in_tool 区分「工具跑太久」与「API 流断了」，善后文案不同。"""
+
+    def __init__(self, in_tool: bool = False):
+        super().__init__()
+        self.in_tool = in_tool
 
 
 @dataclass
@@ -53,7 +66,25 @@ class _RunOutcome:
     api_error_status: int | None = None
     raw_tail: str = ""
     stalled: bool = False
+    stalled_in_tool: bool = False
     timed_out: bool = False
+
+
+def _tool_delta(event: dict) -> int:
+    """本事件让「在跑的工具数」变化多少：发起 tool_use +1，回 tool_result -1。
+
+    只认顶层 assistant/user 事件，不认 stream_event —— 后者是同一次 tool_use 的
+    逐块增量，按它计数会把一个工具重复加好几次。
+    """
+    t = event.get("type")
+    if t not in ("assistant", "user"):
+        return 0
+    want = "tool_use" if t == "assistant" else "tool_result"
+    content = (event.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return 0
+    n = sum(1 for b in content if isinstance(b, dict) and b.get("type") == want)
+    return n if t == "assistant" else -n
 
 
 _TRANSIENT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
@@ -731,18 +762,22 @@ class ClaudeSession:
 
         async def _pump():
             history_logged = False
+            pending_tools = 0          # 已发出 tool_use 但未回 tool_result 的数量
             if stdin_payload:
                 proc.stdin.write(stdin_payload)
                 await proc.stdin.drain()
                 proc.stdin.close()
             while True:
-                # 单行读取设静默上限：超过 _STALL_TIMEOUT 没有任何输出＝流卡死
+                # 单行读取设静默上限。工具执行中用更长的尺子（见 _TOOL_STALL_TIMEOUT
+                # 注释）：Bash 跑长任务时流上本就没有事件，短超时会误杀。
+                in_tool = pending_tools > 0
                 try:
                     line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=_STALL_TIMEOUT
+                        proc.stdout.readline(),
+                        timeout=_TOOL_STALL_TIMEOUT if in_tool else _STALL_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    raise _StreamStalled()
+                    raise _StreamStalled(in_tool=in_tool)
                 if not line:
                     break  # EOF，进程正常结束
                 decoded = line.decode("utf-8", errors="replace")
@@ -755,6 +790,7 @@ class ClaudeSession:
                     event = json.loads(s)
                 except json.JSONDecodeError:
                     continue
+                pending_tools = max(0, pending_tools + _tool_delta(event))
                 if event.get("type") == "system" and event.get("subtype") == "init":
                     sid = event.get("session_id")
                     if sid:
@@ -774,9 +810,10 @@ class ClaudeSession:
             try:
                 await asyncio.wait_for(_pump(), timeout=_RUN_TIMEOUT)
                 await proc.wait()
-            except _StreamStalled:
+            except _StreamStalled as e:
                 await _graceful_kill(proc)
                 out.stalled = True
+                out.stalled_in_tool = e.in_tool
             except asyncio.TimeoutError:
                 await _graceful_kill(proc)
                 out.timed_out = True
@@ -802,9 +839,12 @@ class ClaudeSession:
                     await streamer.append(f"\n\n{msg}")
 
         if out.stalled:
-            print(f"\n🛑 流卡死（{_STALL_TIMEOUT}s 无输出），已中断，会话保留")
-            await _notify(_STALL_MSG)
-            return _STALL_MSG
+            secs = _TOOL_STALL_TIMEOUT if out.stalled_in_tool else _STALL_TIMEOUT
+            what = "工具执行" if out.stalled_in_tool else "流"
+            print(f"\n🛑 {what}卡死（{secs}s 无输出），已中断，会话保留")
+            msg = _TOOL_STALL_MSG if out.stalled_in_tool else _STALL_MSG
+            await _notify(msg)
+            return msg
         if out.timed_out:
             print("\n⏰ 执行超时（会话保留）")
             await _notify(_RUN_TIMEOUT_MSG)
