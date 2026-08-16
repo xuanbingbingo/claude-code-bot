@@ -37,6 +37,13 @@ _STALL_TIMEOUT = int(os.environ.get("CLAUDE_STALL_TIMEOUT", "180"))
 _TOOL_STALL_TIMEOUT = max(_STALL_TIMEOUT,
                           int(os.environ.get("CLAUDE_TOOL_STALL_TIMEOUT", "900")))
 
+# 🔴 stream-json 是「一行一个事件」，而 asyncio 的 StreamReader 默认只肯攒 64KB，
+# 超了 readline() 直接抛 ValueError("Separator is not found, and chunk exceed the
+# limit")，整轮任务当场毙掉——历史现场：读了几张视频关键帧后，单个 tool_result
+# 事件轻松破 64KB，前 13 步全绿最后一步报这个错。默认放到 64MB（对齐 API 的 32MB
+# 上限，留一倍余量）。可用 CLAUDE_STREAM_LIMIT 覆盖（单位字节）。
+_STREAM_LIMIT = int(os.environ.get("CLAUDE_STREAM_LIMIT", str(64 * 1024 * 1024)))
+
 # 逐 token 流式开关，默认开（飞书要像 CLI 一样实时流式）。
 # 可用 CLAUDE_PARTIAL_MESSAGES=0 关闭。
 _PARTIAL_FLAG = (["--include-partial-messages"]
@@ -756,6 +763,7 @@ class ClaudeSession:
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.cwd,
             env=self._spawn_env(),
+            limit=_STREAM_LIMIT,
         )
         self.current_proc = proc
         out = _RunOutcome()
@@ -778,6 +786,13 @@ class ClaudeSession:
                     )
                 except asyncio.TimeoutError:
                     raise _StreamStalled(in_tool=in_tool)
+                except ValueError:
+                    # 兜底：单行连 _STREAM_LIMIT 都撑爆了。asyncio 在抛错前已经把
+                    # 缓冲清空，残余半行会被下一轮当新行读到，由下面的
+                    # JSONDecodeError 静默跳过。丢一个事件也远好过整轮任务崩掉
+                    # ——上限只该是「降级线」，不该是「断头台」。
+                    print("\n⚠️ 跳过一行超长事件（超出 stream limit）", flush=True)
+                    continue
                 if not line:
                     break  # EOF，进程正常结束
                 decoded = line.decode("utf-8", errors="replace")
