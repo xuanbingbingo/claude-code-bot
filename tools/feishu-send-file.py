@@ -38,7 +38,9 @@ BASE = "https://open.feishu.cn/open-apis"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
-SIZE_LIMIT = 28 * 1024 * 1024  # 留余量，飞书硬上限 30MB
+# 超过此值才触发压缩。默认 28MB 留余量；飞书硬上限 30MB，
+# 贴边的文件可用 FEISHU_SEND_SIZE_LIMIT_MB=29.5 免掉一次无谓的重编码。
+SIZE_LIMIT = int(float(os.environ.get("FEISHU_SEND_SIZE_LIMIT_MB", "28")) * 1024 * 1024)
 
 
 def _load_kv(path):
@@ -112,15 +114,44 @@ def _multipart(fields, files):
 
 
 def _compress_video(src):
-    """把超限视频压到飞书上限内。需要 ffmpeg；返回临时 mp4 路径，失败抛异常。"""
+    """把超限视频压到飞书上限内。需要 ffmpeg；返回临时 mp4 路径，失败抛异常。
+
+    码率按「目标体积 / 时长」反算 —— 死码率会把长而已经压好的片子越压越大
+    （795s@385kbps 的 38MB 源用 760k 压出来是 85MB，直接被飞书 400 掉）。
+    """
     out = os.path.join(tempfile.gettempdir(), f"fsf_{uuid.uuid4().hex[:8]}.mp4")
+
+    dur = 0.0
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            dur = float(subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", src],
+                capture_output=True, text=True, timeout=30).stdout.strip())
+        except Exception:
+            dur = 0.0
+
+    src_kbps = int(os.path.getsize(src) * 8 / 1000 / dur) if dur > 0 else 0
+    a_kbps = 64
+    if dur > 0:
+        # 留 8% 余量给容器开销，别贴着 28MB 上限走
+        total_kbps = int(SIZE_LIMIT * 0.92 * 8 / 1000 / dur)
+        v_kbps = max(120, total_kbps - a_kbps)
+    else:
+        v_kbps = 760
+    # 绝不高于源码率，否则「压缩」只会把文件撑大
+    if src_kbps:
+        v_kbps = min(v_kbps, max(120, src_kbps - a_kbps))
+
     subprocess.run([
         "ffmpeg", "-y", "-i", src,
-        "-vf", "scale='min(1080,iw)':-2",
-        "-c:v", "libx264", "-b:v", "760k", "-maxrate", "900k", "-bufsize", "1600k",
-        "-preset", "veryfast", "-c:a", "aac", "-b:a", "96k",
+        "-vf", "scale='min(1280,iw)':-2",
+        "-c:v", "libx264", "-b:v", f"{v_kbps}k",
+        "-maxrate", f"{int(v_kbps * 1.3)}k", "-bufsize", f"{v_kbps * 3}k",
+        "-preset", "medium", "-c:a", "aac", "-b:a", f"{a_kbps}k",
         "-movflags", "+faststart", out,
-    ], check=True, capture_output=True, timeout=600)
+    ], check=True, capture_output=True, timeout=900)
     return out
 
 
