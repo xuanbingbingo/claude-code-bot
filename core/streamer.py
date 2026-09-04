@@ -183,6 +183,18 @@ class StreamerBase(ABC):
             self.text = (fallback or "").strip() or "✅ 完成（无文字输出）"
         await self._flush(True)
 
+    async def interrupted(self, note: str = "⏹ 已被新消息中断"):
+        """被抢占/被 /stop 打断时的收尾 —— 半截内容保留,但必须显式标注。
+
+        不标注的话:进程被 SIGTERM 杀掉后 claude 不会再吐 result 事件,backend.run 返回空串,
+        finalize 又因为 has_content=True 忽略 fallback —— 卡片就停在那半截文字上,
+        看起来跟「回答完了」一模一样。这正是「答到一半没了还没提示」的来源。
+        """
+        if self._finalized:
+            return
+        body = self.text.rstrip()
+        await self.finalize(override_text=f"{body}\n\n{note}" if body else note)
+
     async def discard(self) -> bool:
         """接力已另发独立 @ 消息后,丢弃本条流式过程消息,避免与接力消息重复。
         基类无法真正撤回,退化为收尾一个极短指引;支持撤回的平台(飞书)覆盖本方法。"""
