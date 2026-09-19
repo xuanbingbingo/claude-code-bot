@@ -29,24 +29,22 @@ class CommandRouter:
         self.voice = voice          # VoiceService | None;None = 本 bot 没开语音能力
 
     def _voice_list_text(self) -> str:
-        """按引擎分组列出音色;不可用的单独标出来,别让人选了才发现没声音。"""
-        cat = load_voice_catalog()
+        """按引擎分组列出音色。
+
+        只列能用的 —— 不可用的(如模型文件缺失的本地音色)对用户是纯噪音,列出来只会让人
+        选了才发现没声音;真选中了 /voice 分支还是会明确拦下并说明原因。
+        """
+        cat = [v for v in load_voice_catalog() if v["usable"]]
         if not cat:
-            return "❌ 读不到音色表（~/aiProjects/hf-voice/voices.json）"
+            return "❌ 读不到可用音色（检查 ~/aiProjects/hf-voice/voices.json）"
         groups: dict[str, list[str]] = {}
-        broken: list[str] = []
         for v in cat:
             label = v["name"] + (f"（{v['alias'][0]}）" if v["alias"] else "")
-            if v["usable"]:
-                groups.setdefault(v["engine"], []).append(label)
-            else:
-                broken.append(label)
-        lines = [f"🎙 可用音色（{sum(len(x) for x in groups.values())} 个）"]
+            groups.setdefault(v["engine"], []).append(label)
+        lines = [f"🎙 可用音色（{len(cat)} 个）"]
         for engine, names in groups.items():
             tag = {"sami": "剪映", "edge": "微软", "kokoro": "本地"}.get(engine, engine)
             lines.append(f"\n【{tag}】" + "、".join(names))
-        if broken:
-            lines.append(f"\n\n⚠️ 暂不可用（模型文件缺失）：{'、'.join(broken)}")
         lines.append("\n\n换音色:/voice <音色名>　（名字/别名/编号都认）")
         return "\n".join(lines)
 

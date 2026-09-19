@@ -17,6 +17,9 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 
+# hfvoice 可执行文件:默认取 PATH 里的 hfvoice;HFVOICE_BIN 可指到具体路径
+# (某些机器上 /opt/homebrew/bin/hfvoice 是从别处拷来的壳,内部路径写死指向别人的家目录)
+_HFVOICE_BIN = os.environ.get("HFVOICE_BIN", "").strip() or "hfvoice"
 _POLYPHONES = os.path.expanduser("~/aiProjects/koubo-subtitle-kit/polyphones.json")
 _VOICES_JSON = os.path.expanduser("~/aiProjects/hf-voice/voices.json")
 _KOKORO_MODELS = os.path.expanduser("~/aiProjects/hf-voice/kokoro_models")
@@ -297,7 +300,7 @@ class VoiceService:
         fd, wav = tempfile.mkstemp(suffix=".wav", prefix="botvoice_")
         os.close(fd)
         env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
-        cmd = ["hfvoice", speech, wav]
+        cmd = [_HFVOICE_BIN, speech, wav]
         if voice:
             cmd += ["-v", voice]
         for attempt in range(3):
