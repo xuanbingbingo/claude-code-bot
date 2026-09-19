@@ -46,6 +46,12 @@ class FeishuAdapter(PlatformAdapter):
         rt = "chat_id" if chat_type == "group" else "open_id"
         await asyncio.to_thread(self.api.send_message, conv_id, "text", {"text": text}, rt)
 
+    supports_voice = True
+
+    async def send_voice(self, conv_id, chat_type, path, duration_ms):
+        rt = "chat_id" if chat_type == "group" else "open_id"
+        return await asyncio.to_thread(self.api.send_audio, conv_id, path, duration_ms, rt)
+
     def state_key(self):
         return self.app_id      # 飞书 app_id 唯一稳定非敏感,按 bot 隔离会话指针文件
 

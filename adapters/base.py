@@ -25,6 +25,12 @@ class PlatformAdapter(ABC):
         ...
 
     # ---- 可选钩子(默认空实现)----
+    supports_voice = False              # True 的平台才会触发 TTS(否则白合成一场)
+
+    async def send_voice(self, conv_id: str, chat_type: str, path: str, duration_ms: int) -> bool:
+        """把合成好的语音文件发到平台。仅 supports_voice=True 的适配器需要实现。"""
+        return False
+
     def backend_env(self, inbound) -> dict:
         """注入给 backend 的平台环境变量(飞书 send-file 需要发起人 id + 凭证)。"""
         return {}

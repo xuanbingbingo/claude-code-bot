@@ -13,12 +13,16 @@ _HELP = (
     "会话:/new /sessions /resume <编号|id> /rename [<id>] <名> \n"
     "运行:/stop /model [opus|sonnet|haiku|default] /mode [bypass|plan|default|accept]\n"
     "目录:/cwd [<路径>]   ·   状态:/status\n"
+    "语音:/voice [on|off]（默认开,每条回复附一条语音）\n"
     "Agent:/agents [关键词] /agent <name> <任务>\n"
     "其它 /xxx 透传给后端(如官方 skill)"
 )
 
 
 class CommandRouter:
+    def __init__(self, voice=None):
+        self.voice = voice          # VoiceService | None;None = 本 bot 没开语音能力
+
     async def dispatch(self, inbound, backend, adapter) -> bool:
         text = inbound.text.strip()
         cid, ct = inbound.conv_id, inbound.chat_type
@@ -153,6 +157,20 @@ class CommandRouter:
             # 改写成派发 prompt,返回 False 继续走 backend.run(带 streamer)
             inbound.text = f'请调用 subagent "{name}" 完成以下任务,并把它的结果原样返回:\n\n{parts[2].strip()}'
             return False
+
+        if text.startswith("/voice"):
+            if not self.voice or not getattr(adapter, "supports_voice", False):
+                await reply("ℹ️ 当前平台/配置未启用语音回复"); return True
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if arg in ("on", "开", "1", "true"):
+                self.voice.set(cid, True); await reply("🔊 已开启语音回复（每条回复附一条语音）")
+            elif arg in ("off", "关", "0", "false"):
+                self.voice.set(cid, False); await reply("🔇 已关闭语音回复（仍照常发文字）")
+            else:
+                state = "开启" if self.voice.is_on(cid) else "关闭"
+                await reply(f"🔊 语音回复：{state}\n切换:/voice on|off")
+            return True
 
         if text.startswith("/start"):
             await reply(_HELP); return True

@@ -15,6 +15,7 @@
 - **运行控制**（飞书） → `/stop` 中断任务，`/model` 切模型，`/mode` 切权限模式（bypass / plan / default / accept）
 - **Subagent 透传**（飞书） → `/agents` 列出 Claude Code 自定义 subagent，`/agent <name> <任务>` 一键派发
 - **Skills 透传**（飞书） → 未注册的 `/xxx` 直接作为 prompt 传给 `claude` CLI，可直接用官方 skill
+- **语音回复**（飞书） → 每条回复在文字之后再追一条语音条（TTS 合成 → opus），默认开启，`/voice off` 可按会话关闭
 
 两个渠道完全独立，可以只装一个、也可以两个都装。
 
@@ -174,6 +175,28 @@ bash start-claude-feishu.sh
 | `/new` | 下一条消息开启全新会话 |
 
 启动时会自动接续当前工作目录下最近一条可用会话；如果该会话历史数据不兼容（API 400），第一次消息会自动回退新会话模式，你重发即可。
+
+#### 语音回复
+
+| 命令 | 说明 |
+|------|------|
+| `/voice` | 查看当前会话的语音开关状态 |
+| `/voice on` | 开启语音回复（默认即开） |
+| `/voice off` | 关闭语音回复（文字照常发） |
+
+文字回复收尾后，网关会异步合成一条语音追发过去——**合成不占对话主流程**，下一条消息不会被它堵住。
+被 `/stop` 或新消息抢占的半截回复不会被念出来。
+
+实现要点（`core/tts.py`）：
+
+- 念稿会先清洗：代码块整块替换为「代码略」、URL 换成「链接」、表格/emoji/markdown 符号剔除
+- 多音字走 `~/aiProjects/koubo-subtitle-kit/polyphones.json`（唯一真相源）的 `auto_fix` 规则，
+  另有「塞 → 腮」这类改音不改字的内置补充；**只进合成稿，不影响发给用户的文字**
+- 超过 `BOT_VOICE_MAX_CHARS`（默认 600 字）在句末截断，并在结尾补一句「后面还有内容，请看文字」
+- 合成用 `hfvoice`（默认清爽男声），失败自动重试 3 次并剥掉 `HTTP(S)_PROXY`（edge-tts 走代理必挂）
+- 🔴 飞书语音条只认 **opus**（单声道 / 16kHz），由 ffmpeg 转码；传 wav 能上传成功但会渲染成文件附件
+
+依赖：`hfvoice`（`~/aiProjects/hf-voice/`）与 `ffmpeg` / `ffprobe` 需在 PATH 中。
 
 #### 运行控制
 
@@ -423,6 +446,9 @@ python3 tools/feishu-send-file.py /path/to/video.mp4 ou_xxxxxxxx   # 发给指�
 | `BOT_PERSONA` | 直接内联一段人设文本（优先级最高） |
 | `BOT_PERSONA_FILE` | 指向一个角色 `.md` 文件，自动去掉 YAML frontmatter 后作为人设 |
 | `BOT_NAME` | 仅用于启动日志显示 |
+| `BOT_VOICE` | `0`/`off`/`false` 关闭语音回复；缺省为开 |
+| `BOT_VOICE_NAME` | 指定 hfvoice 音色（如 `edge2`=微软云扬）；留空用 hfvoice 默认（清爽男声） |
+| `BOT_VOICE_MAX_CHARS` | 语音念稿字数上限，默认 600，超出截断并提示看文字 |
 
 两者都不设时行为与原版完全一致（通用无人设），**对现有单 bot / 主网关零影响**。
 

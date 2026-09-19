@@ -16,6 +16,7 @@ from core.session_manager import SessionManager        # noqa: E402
 from core.commands import CommandRouter                # noqa: E402
 from core.relay import RelayManager                    # noqa: E402
 from core.gateway import Gateway                       # noqa: E402
+from core.tts import VoiceService                      # noqa: E402
 from backends import make_backend                      # noqa: E402
 from adapters import make_adapter                      # noqa: E402
 
@@ -42,13 +43,22 @@ def main():
 
     # state_key 按平台取 bot 唯一标识(飞书 app_id / 企微 bot_id / TG botid),用于跨重启会话续接落盘
     sessions = SessionManager(backend_factory, state_key=adapter.state_key())
-    gateway = Gateway(adapter, sessions, CommandRouter(), relay)
+
+    # 语音回复:仅支持的平台(目前飞书)且未显式关掉时才装;会话级开关按 bot 隔离落盘
+    voice = None
+    if config.voice_enabled and getattr(adapter, "supports_voice", False):
+        voice = VoiceService(enabled_default=True, voice_name=config.voice_name,
+                             max_chars=config.voice_max_chars, state_key=adapter.state_key())
+    gateway = Gateway(adapter, sessions, CommandRouter(voice=voice), relay, voice=voice)
 
     print(f"🤖 启动 {config.platform} × {config.backend}  bot={config.bot_name or '(未命名)'}")
     if config.persona:
         print(f"   🎭 人设 {len(config.persona)} 字")
     if sessions.loaded_count():
         print(f"   🔖 已加载 {sessions.loaded_count()} 条会话指针(重启自动续接)")
+    if voice:
+        print(f"   🔊 语音回复已开启（音色 {config.voice_name or 'hfvoice 默认'}，"
+              f"上限 {config.voice_max_chars} 字，/voice off 可关）")
     if config.relay_enabled and config.relay_teammates:
         print(f"   🔗 relay 队友:{list(config.relay_teammates)}")
     asyncio.run(adapter.connect(gateway))

@@ -19,6 +19,13 @@ def load_env(script_dir: str | None = None) -> None:
                     os.environ.setdefault(k.strip(), v.strip())
 
 
+def _int_env(key: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(key, "").strip() or default))
+    except ValueError:
+        return default
+
+
 def parse_teammates(raw: str) -> dict:
     """解析 BOT_TEAMMATES:'别名:显示名,...' → {别名: 显示名};省略冒号则别名=显示名。"""
     out: dict[str, str] = {}
@@ -43,6 +50,9 @@ class BotConfig:
     relay_enabled: bool                 # BOT_RELAY=1
     relay_max_hops: int                 # BOT_MAX_HOPS
     relay_teammates: dict = field(default_factory=dict)  # 别名→显示名
+    voice_enabled: bool = True          # BOT_VOICE=0 关闭;默认开
+    voice_name: str = ""                # BOT_VOICE_NAME,空=hfvoice 默认音色(清爽男声)
+    voice_max_chars: int = 600          # BOT_VOICE_MAX_CHARS,超出截断并提示看文字
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -59,4 +69,7 @@ class BotConfig:
             relay_enabled=os.environ.get("BOT_RELAY", "") == "1",
             relay_max_hops=max_hops,
             relay_teammates=parse_teammates(os.environ.get("BOT_TEAMMATES", "")),
+            voice_enabled=os.environ.get("BOT_VOICE", "1").strip() not in ("0", "off", "false"),
+            voice_name=os.environ.get("BOT_VOICE_NAME", "").strip(),
+            voice_max_chars=_int_env("BOT_VOICE_MAX_CHARS", 600),
         )

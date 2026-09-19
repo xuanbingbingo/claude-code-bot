@@ -12,6 +12,7 @@ adapter 收到平台消息 → 构造 InboundMessage → await gateway.handle(in
 被抢占的那轮不许静默收尾:半截内容留在卡片上但显式标注中断,否则半截答案会冒充完整答案。
 """
 import asyncio
+import os
 
 
 class _RunSlot:
@@ -34,12 +35,40 @@ class Gateway:
     PREEMPT_NOTE = "⏹ 已被新消息中断"
     STOP_NOTE = "🛑 已手动中断（/stop）"
 
-    def __init__(self, adapter, session_manager, command_router, relay):
+    def __init__(self, adapter, session_manager, command_router, relay, voice=None):
         self.adapter = adapter
         self.sessions = session_manager
         self.commands = command_router
         self.relay = relay
+        self.voice = voice                  # VoiceService | None(None = 不出语音)
         self._slots: dict[str, _RunSlot] = {}
+
+    def _spawn_voice(self, inbound, text: str):
+        """异步合成并发送语音;任何失败都只打日志,绝不影响已发出的文字回复。"""
+        if not self.voice or not getattr(self.adapter, "supports_voice", False):
+            return
+        if not text or not self.voice.is_on(inbound.conv_id):
+            return
+        asyncio.create_task(self._voice_task(inbound, text))
+
+    async def _voice_task(self, inbound, text: str):
+        clip = None
+        try:
+            clip = await self.voice.synthesize(text)
+            if not clip:
+                return
+            ok = await self.adapter.send_voice(
+                inbound.conv_id, inbound.chat_type, clip.path, clip.duration_ms)
+            if not ok:
+                print("[WARN] 语音发送失败(文字已送达,忽略)")
+        except Exception as e:
+            print(f"[WARN] 语音追发异常:{e}")
+        finally:
+            if clip:
+                try:
+                    os.unlink(clip.path)
+                except Exception:
+                    pass
 
     def _slot(self, conv_id: str) -> _RunSlot:
         slot = self._slots.get(conv_id)
@@ -115,3 +144,7 @@ class Gateway:
                 await streamer.discard()
             else:
                 await streamer.finalize(fallback=resp)
+                # 文字收尾后再追一条语音。发射即忘:TTS 是秒级阻塞(短句 ~4s),
+                # 挂在这里会把 slot 锁一直攥着,下一条消息得干等语音合成完 —— 那比没有语音更难受。
+                # 只走正常收尾这一支:被抢占/被 /stop 的半截回复不该被念出来。
+                self._spawn_voice(inbound, streamer.text or resp)

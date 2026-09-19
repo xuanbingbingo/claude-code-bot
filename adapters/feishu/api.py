@@ -1,6 +1,7 @@
 """飞书 REST 封装 —— 同步 httpx(streamer 用 asyncio.to_thread 调,避免堵 claude 读取循环)。
 从旧 claude-feishu.py L66-187 抽出。"""
 import json
+import os
 
 import httpx
 
@@ -34,6 +35,34 @@ class FeishuAPI:
         if data.get("code") != 0:
             print(f"[WARN] send_message failed: {data}")
         return data
+
+    def upload_opus(self, path: str, duration_ms: int) -> str:
+        """上传语音文件,返回 file_key。
+
+        🔴 飞书语音条只认 file_type="opus"(单声道 ogg/opus);传 wav 也能上传成功,
+        但发出来会渲染成「文件」附件而不是可播放的语音条 —— 转码在 core/tts.py 做。
+        """
+        with open(path, "rb") as f:
+            resp = httpx.post(
+                f"{BASE}/im/v1/files",
+                headers={"Authorization": f"Bearer {self.token()}"},
+                data={"file_type": "opus", "file_name": os.path.basename(path),
+                      "duration": str(max(1, int(duration_ms)))},
+                files={"file": (os.path.basename(path), f, "audio/opus")}, timeout=120)
+        data = resp.json()
+        if data.get("code") != 0:
+            print(f"[WARN] upload_opus failed: {data}")
+            return ""
+        return data.get("data", {}).get("file_key", "")
+
+    def send_audio(self, receive_id: str, path: str, duration_ms: int,
+                   receive_id_type="open_id") -> bool:
+        """发一条语音消息(上传 + 发送两步)。"""
+        file_key = self.upload_opus(path, duration_ms)
+        if not file_key:
+            return False
+        data = self.send_message(receive_id, "audio", {"file_key": file_key}, receive_id_type)
+        return data.get("code") == 0
 
     def send_card(self, receive_id: str, text: str, receive_id_type="open_id") -> str:
         """发卡片,返回 message_id(供后续 PATCH)。"""
