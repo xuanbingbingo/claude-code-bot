@@ -54,7 +54,7 @@ class Gateway:
     async def _voice_task(self, inbound, text: str):
         clip = None
         try:
-            clip = await self.voice.synthesize(text)
+            clip = await self.voice.synthesize(text, self.voice.voice_for(inbound.conv_id))
             if not clip:
                 return
             ok = await self.adapter.send_voice(

@@ -4,8 +4,11 @@ dispatch(inbound, backend, adapter) -> bool:True=已作为命令处理;False=透
 回复统一经 adapter.send_text;命令对 backend 的操作按 backend.capabilities 门控
 (不支持的命令回提示而非报错,这样 Hermes 等后端也能优雅降级)。
 """
+import asyncio
 import os
 from datetime import datetime
+
+from .tts import load_voice_catalog, resolve_voice
 
 _HELP = (
     "🤖 Claude Code Gateway 已就绪\n\n"
@@ -13,15 +16,56 @@ _HELP = (
     "会话:/new /sessions /resume <编号|id> /rename [<id>] <名> \n"
     "运行:/stop /model [opus|sonnet|haiku|default] /mode [bypass|plan|default|accept]\n"
     "目录:/cwd [<路径>]   ·   状态:/status\n"
-    "语音:/voice [on|off]（默认开,每条回复附一条语音）\n"
+    "语音:/voice [on|off] · /voice <音色名> 换音色 · /voice list 看全部\n"
     "Agent:/agents [关键词] /agent <name> <任务>\n"
     "其它 /xxx 透传给后端(如官方 skill)"
 )
 
 
 class CommandRouter:
+    PREVIEW_TEXT = "这是音色试听。你好，我是你的飞书助手，现在用的就是这个声音。"
+
     def __init__(self, voice=None):
         self.voice = voice          # VoiceService | None;None = 本 bot 没开语音能力
+
+    def _voice_list_text(self) -> str:
+        """按引擎分组列出音色;不可用的单独标出来,别让人选了才发现没声音。"""
+        cat = load_voice_catalog()
+        if not cat:
+            return "❌ 读不到音色表（~/aiProjects/hf-voice/voices.json）"
+        groups: dict[str, list[str]] = {}
+        broken: list[str] = []
+        for v in cat:
+            label = v["name"] + (f"（{v['alias'][0]}）" if v["alias"] else "")
+            if v["usable"]:
+                groups.setdefault(v["engine"], []).append(label)
+            else:
+                broken.append(label)
+        lines = [f"🎙 可用音色（{sum(len(x) for x in groups.values())} 个）"]
+        for engine, names in groups.items():
+            tag = {"sami": "剪映", "edge": "微软", "kokoro": "本地"}.get(engine, engine)
+            lines.append(f"\n【{tag}】" + "、".join(names))
+        if broken:
+            lines.append(f"\n\n⚠️ 暂不可用（模型文件缺失）：{'、'.join(broken)}")
+        lines.append("\n\n换音色:/voice <音色名>　（名字/别名/编号都认）")
+        return "\n".join(lines)
+
+    async def _voice_preview(self, adapter, conv_id: str, chat_type: str, voice_name: str):
+        """切完音色当场发一条试听;失败只提示,不影响已经生效的设置。"""
+        try:
+            clip = await self.voice.synthesize(self.PREVIEW_TEXT, voice_name)
+            if not clip:
+                await adapter.send_text(conv_id, chat_type, "⚠️ 试听合成失败（音色已切，下条回复会用它）")
+                return
+            try:
+                await adapter.send_voice(conv_id, chat_type, clip.path, clip.duration_ms)
+            finally:
+                try:
+                    os.unlink(clip.path)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[WARN] 音色试听失败:{e}")
 
     async def dispatch(self, inbound, backend, adapter) -> bool:
         text = inbound.text.strip()
@@ -162,14 +206,38 @@ class CommandRouter:
             if not self.voice or not getattr(adapter, "supports_voice", False):
                 await reply("ℹ️ 当前平台/配置未启用语音回复"); return True
             parts = text.split(maxsplit=1)
-            arg = parts[1].strip().lower() if len(parts) > 1 else ""
-            if arg in ("on", "开", "1", "true"):
-                self.voice.set(cid, True); await reply("🔊 已开启语音回复（每条回复附一条语音）")
-            elif arg in ("off", "关", "0", "false"):
-                self.voice.set(cid, False); await reply("🔇 已关闭语音回复（仍照常发文字）")
-            else:
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            low = arg.lower()
+
+            if not arg:
                 state = "开启" if self.voice.is_on(cid) else "关闭"
-                await reply(f"🔊 语音回复：{state}\n切换:/voice on|off")
+                cur = self.voice.voice_for(cid) or "hfvoice 默认"
+                await reply(f"🔊 语音回复：{state}\n🎙 当前音色：{cur}\n\n"
+                            "切换开关:/voice on|off\n换音色:/voice <音色名>\n看全部:/voice list")
+                return True
+
+            if low in ("on", "开", "1", "true"):
+                self.voice.set(cid, True); await reply("🔊 已开启语音回复"); return True
+            if low in ("off", "关", "0", "false"):
+                self.voice.set(cid, False); await reply("🔇 已关闭语音回复（仍照常发文字）"); return True
+
+            if low in ("list", "列表", "ls"):
+                await reply(self._voice_list_text()); return True
+
+            # 其余一律当音色名解析(名字/别名/编号都认)
+            hit = resolve_voice(arg)
+            if not hit:
+                await reply(f"❌ 没有这个音色：{arg}\n发 /voice list 看全部"); return True
+            if not hit["usable"]:
+                # kokoro 模型文件丢过一次,选了会静默没声音 —— 提前拦下,别让用户以为是网关坏了
+                await reply(f"⚠️ 音色「{hit['name']}」当前不可用（本地 kokoro 模型文件缺失）\n"
+                            "请换 sami / edge 的音色，/voice list 看全部"); return True
+            self.voice.set_voice(cid, hit["name"])
+            if not self.voice.is_on(cid):
+                self.voice.set(cid, True)
+            await reply(f"🎙 音色已切到「{hit['name']}」（{hit['engine']}）\n正在合成一条试听…")
+            # 试听异步发:合成要几秒,不该把命令响应吊在这里
+            asyncio.create_task(self._voice_preview(adapter, cid, ct, hit["name"]))
             return True
 
         if text.startswith("/start"):

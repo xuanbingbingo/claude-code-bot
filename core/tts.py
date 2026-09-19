@@ -18,10 +18,50 @@ import tempfile
 from dataclasses import dataclass
 
 _POLYPHONES = os.path.expanduser("~/aiProjects/koubo-subtitle-kit/polyphones.json")
+_VOICES_JSON = os.path.expanduser("~/aiProjects/hf-voice/voices.json")
+_KOKORO_MODELS = os.path.expanduser("~/aiProjects/hf-voice/kokoro_models")
 
 # 代理相关变量全部剥掉:edge-tts 走 AntProxy 必然握手失败(见 hfvoice 记忆)
 _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                "http_proxy", "https_proxy", "all_proxy")
+
+
+def kokoro_available() -> bool:
+    """kokoro 是本地引擎,模型文件曾在一次清理里丢失 —— 缺文件时选它会直接报错没声音。
+    故动态探测:模型在就放行,不在就从可选音色里摘掉(而不是写死「kokoro 不可用」)。"""
+    return (os.path.isdir(_KOKORO_MODELS)
+            and any(f.endswith(".bin") for f in os.listdir(_KOKORO_MODELS)))
+
+
+def load_voice_catalog() -> list[dict]:
+    """读 hfvoice 的 voices.json(唯一真相源) → [{name, engine, alias, usable}]。"""
+    try:
+        with open(_VOICES_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[WARN] 读取音色表失败:{e}")
+        return []
+    kok = kokoro_available()
+    out = []
+    for name, meta in data.items():
+        if name.startswith("_") or not isinstance(meta, dict):
+            continue
+        engine = meta.get("engine", "")
+        out.append({"name": name, "engine": engine,
+                    "alias": [str(a) for a in (meta.get("alias") or [])],
+                    "usable": kok if engine == "kokoro" else True})
+    return out
+
+
+def resolve_voice(query: str) -> dict | None:
+    """把用户输入(音色名/别名/编号)解析成目录项;解析不到返回 None。"""
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    for v in load_voice_catalog():
+        if q == v["name"].lower() or q in [a.lower() for a in v["alias"]]:
+            return v
+    return None
 
 
 @dataclass
@@ -159,7 +199,7 @@ class VoiceService:
         self.enabled_default = enabled_default
         self.voice_name = voice_name          # 空 = 用 hfvoice 自己的默认音色(清爽男声)
         self.max_chars = max(0, max_chars)
-        self._prefs: dict[str, bool] = {}
+        self._prefs: dict[str, dict] = {}     # conv_id -> {"on": bool, "voice": str}
         self._state_file = None
         if state_key:
             base = state_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -168,12 +208,18 @@ class VoiceService:
 
     # ---- 开关持久化 ----
     def _load(self):
+        """兼容旧格式:早期落盘是 {conv_id: bool},现在是 {conv_id: {on, voice}}。"""
         try:
-            if self._state_file and os.path.isfile(self._state_file):
-                with open(self._state_file, encoding="utf-8") as f:
-                    self._prefs = {k: bool(v) for k, v in (json.load(f) or {}).items()}
+            if not (self._state_file and os.path.isfile(self._state_file)):
+                return
+            with open(self._state_file, encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            for k, v in raw.items():
+                self._prefs[k] = ({"on": bool(v), "voice": ""} if isinstance(v, bool)
+                                  else {"on": bool(v.get("on", True)),
+                                        "voice": str(v.get("voice") or "")})
         except Exception as e:
-            print(f"[WARN] 加载语音开关失败:{e}")
+            print(f"[WARN] 加载语音偏好失败:{e}")
 
     def _save(self):
         if not self._state_file:
@@ -182,13 +228,26 @@ class VoiceService:
             with open(self._state_file, "w", encoding="utf-8") as f:
                 json.dump(self._prefs, f, ensure_ascii=False)
         except Exception as e:
-            print(f"[WARN] 保存语音开关失败:{e}")
+            print(f"[WARN] 保存语音偏好失败:{e}")
+
+    def _entry(self, conv_id: str) -> dict:
+        return self._prefs.get(conv_id) or {}
 
     def is_on(self, conv_id: str) -> bool:
-        return self._prefs.get(conv_id, self.enabled_default)
+        return bool(self._entry(conv_id).get("on", self.enabled_default))
 
     def set(self, conv_id: str, on: bool):
-        self._prefs[conv_id] = bool(on)
+        e = self._entry(conv_id)
+        self._prefs[conv_id] = {"on": bool(on), "voice": e.get("voice", "")}
+        self._save()
+
+    def voice_for(self, conv_id: str) -> str:
+        """会话级音色 > 本 bot 的 BOT_VOICE_NAME > hfvoice 默认(空串)。"""
+        return self._entry(conv_id).get("voice") or self.voice_name
+
+    def set_voice(self, conv_id: str, name: str):
+        e = self._entry(conv_id)
+        self._prefs[conv_id] = {"on": bool(e.get("on", self.enabled_default)), "voice": name or ""}
         self._save()
 
     # ---- 合成 ----
@@ -208,17 +267,18 @@ class VoiceService:
             t = cut + "后面还有内容，请看文字。"
         return t
 
-    async def synthesize(self, text: str) -> VoiceClip | None:
+    async def synthesize(self, text: str, voice: str | None = None) -> VoiceClip | None:
         speech = self.prepare_text(text)
         if not speech:
             return None
-        return await asyncio.to_thread(self._synth_blocking, speech)
+        return await asyncio.to_thread(self._synth_blocking, speech,
+                                       self.voice_name if voice is None else voice)
 
     # ---- 以下在线程里跑(subprocess 阻塞) ----
-    def _synth_blocking(self, speech: str) -> VoiceClip | None:
+    def _synth_blocking(self, speech: str, voice: str = "") -> VoiceClip | None:
         wav = opus = ""
         try:
-            wav = self._tts(speech)
+            wav = self._tts(speech, voice)
             if not wav:
                 return None
             opus = self._to_opus(wav)
@@ -232,14 +292,14 @@ class VoiceService:
             if wav:
                 _unlink(wav)
 
-    def _tts(self, speech: str) -> str:
+    def _tts(self, speech: str, voice: str = "") -> str:
         """hfvoice 合成 wav。剥掉代理(edge-tts 走代理必挂) + 重试 3 次(TLS reset 常见)。"""
         fd, wav = tempfile.mkstemp(suffix=".wav", prefix="botvoice_")
         os.close(fd)
         env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
         cmd = ["hfvoice", speech, wav]
-        if self.voice_name:
-            cmd += ["-v", self.voice_name]
+        if voice:
+            cmd += ["-v", voice]
         for attempt in range(3):
             try:
                 r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
