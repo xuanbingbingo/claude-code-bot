@@ -30,6 +30,7 @@ class StreamerBase(ABC):
         self._finalized = False
         self._last_event = time.monotonic()      # 最后一次收到 claude 事件的时刻
         self._hb: asyncio.Task | None = None
+        self.banner = ""                         # 置顶横幅(长任务跑过软上限时挂);收尾即撤
 
     # ---- 子类必须实现:把渲染好的文本发到平台(final=True 为收尾帧)----
     @abstractmethod
@@ -37,7 +38,7 @@ class StreamerBase(ABC):
 
     # ---- 渲染(子类可覆盖以加字节预算 / 折叠)----
     def _render(self) -> str:
-        parts = []
+        parts = [self.banner] if self.banner else []
         if self.steps:
             shown = self.steps[-self.MAX_STEPS:]
             parts.append(f"**📋 已完成 {len(self.steps)} 步**\n" +
@@ -160,6 +161,16 @@ class StreamerBase(ABC):
         self.current_status = ""
         await self._schedule()
 
+    async def set_banner(self, line: str):
+        """挂/撤置顶横幅。不是 claude 事件,不 _touch —— 否则会抹掉真实的静默计时。"""
+        if self._finalized or line == self.banner:
+            return
+        self.banner = line
+        try:
+            await self._flush(False)
+        except Exception:
+            pass                                # 平台抖动不该掀翻整轮对话
+
     async def add_thinking(self, chunk: str):
         if chunk:
             self.current_status = "💭 " + chunk[-60:].replace("\n", " ").strip()
@@ -177,6 +188,7 @@ class StreamerBase(ABC):
             self._pending.cancel()
         self._archive_status()
         self.current_status = ""
+        self.banner = ""                        # 「继续在跑」的横幅到收尾就过期了
         if override_text:
             self.text = override_text.strip()
         elif not self.has_content:

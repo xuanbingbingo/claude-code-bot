@@ -81,6 +81,10 @@ class ClaudeCodeBackend(AgentBackend):
         return self.session.current_session_id
 
     @property
+    def last_run_went_long(self) -> bool:
+        return self.session.last_run_went_long
+
+    @property
     def resumable_session_id(self):
         return self.session.resumable_session_id
 

@@ -39,6 +39,9 @@ class AgentBackend(ABC):
     def set_model(self, name: str | None) -> None: ...
     def set_mode(self, name: str) -> bool: return False
     async def stop(self) -> bool: return False
+    # 上一轮是否跑过了软时长上限(网关据此收尾时另发完成提醒);不支持的后端恒 False
+    @property
+    def last_run_went_long(self) -> bool: return False
 
     # ---- 会话列表(capability sessions)----
     def list_sessions(self, limit: int = 10) -> list: return []

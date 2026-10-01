@@ -21,10 +21,18 @@ CLAUDE_CWD = os.environ.get("CLAUDE_CWD", os.path.expanduser("~/aiProjects"))
 # 如确实想重开，自己发 /new。网络抖动等临时问题不该丢掉整个会话上下文。
 _RETRY_NOTE = "\n\n↩️ 会话已保留，直接重发即可接着上面继续；如想重开会话发 /new。"
 
-# 单次 claude 执行超时（秒）。长任务被砍会导致飞书消息「没返回全」，默认放宽到 1800s（30 分钟）。
-# 可用环境变量 CLAUDE_RUN_TIMEOUT 覆盖。
+# 单次 claude 执行的时长两把尺子（秒）：
+# - CLAUDE_RUN_TIMEOUT（软，默认 1800 = 30 分钟）：到点**不杀**，只在卡片顶上挂一条
+#   「已跑满 N 分钟、继续在跑」的横幅，并标记本轮为长任务（收尾时网关另发一条提醒）。
+#   以前到点直接 SIGTERM，半小时以上的任务一律被砍、连带前台命令一起死。
+# - CLAUDE_RUN_HARD_TIMEOUT（硬，默认 14400 = 4 小时）：真·兜底，防跑飞，到点才杀。
+#   设成 ≤ 软上限即退回旧行为（软上限到点直接杀）。
 _RUN_TIMEOUT = int(os.environ.get("CLAUDE_RUN_TIMEOUT", "1800"))
-_RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_TIMEOUT // 60} 分钟）。{_RETRY_NOTE}"
+_RUN_HARD_TIMEOUT = max(_RUN_TIMEOUT, int(os.environ.get("CLAUDE_RUN_HARD_TIMEOUT", "14400")))
+_RUN_TIMEOUT_MSG = f"❌ 执行超时（超过 {_RUN_HARD_TIMEOUT // 60} 分钟硬上限）。{_RETRY_NOTE}"
+_LONG_RUN_BANNER = (f"⏳ 已跑满 {_RUN_TIMEOUT // 60} 分钟，任务继续在跑"
+                    f"（硬上限 {_RUN_HARD_TIMEOUT // 60} 分钟），完成后另发消息提醒你。"
+                    "问「好了吗」不会打断它；发新指令或 /stop 会中断。")
 
 # 静默看门狗：单次超过该秒数没有任何流输出，判定 API 流卡死（stalled），
 # 立即中断而不是干等总超时。可用 CLAUDE_STALL_TIMEOUT 覆盖。
@@ -645,6 +653,8 @@ class ClaudeSession:
         self.model: str | None = None  # None = 用 Claude CLI 默认
         self.mode: str = "bypass"
         self.current_proc: asyncio.subprocess.Process | None = None
+        # 上一轮是否跑过了软上限（_RUN_TIMEOUT）；网关据此在收尾时另发一条完成提醒
+        self.last_run_went_long = False
         # 注入到 claude 子进程环境的额外变量（在 os.environ 之上 merge）。
         # 飞书/TG 网关用它把「当前会话发起人」标识传进去，供 feishu-send-file 等
         # 工具实现「发到当前聊天窗口」。一个会话进程固定服务一个发起人，启动时设一次即可。
@@ -767,6 +777,21 @@ class ClaudeSession:
         )
         self.current_proc = proc
         out = _RunOutcome()
+        self.last_run_went_long = False
+
+        async def _soft_deadline():
+            # 软上限只打标记 + 挂横幅，绝不碰进程（见 _RUN_TIMEOUT 注释）
+            await asyncio.sleep(_RUN_TIMEOUT)
+            self.last_run_went_long = True
+            print(f"\n⏳ 已跑满 {_RUN_TIMEOUT // 60} 分钟，继续运行（硬上限 {_RUN_HARD_TIMEOUT // 60} 分钟）",
+                  flush=True)
+            if streamer is not None and hasattr(streamer, "set_banner"):
+                try:
+                    await streamer.set_banner(_LONG_RUN_BANNER)
+                except Exception:
+                    pass
+        soft = (asyncio.create_task(_soft_deadline())
+                if _RUN_HARD_TIMEOUT > _RUN_TIMEOUT else None)
 
         async def _pump():
             history_logged = False
@@ -823,7 +848,7 @@ class ClaudeSession:
 
         try:
             try:
-                await asyncio.wait_for(_pump(), timeout=_RUN_TIMEOUT)
+                await asyncio.wait_for(_pump(), timeout=_RUN_HARD_TIMEOUT)
                 await proc.wait()
             except _StreamStalled as e:
                 await _graceful_kill(proc)
@@ -833,6 +858,8 @@ class ClaudeSession:
                 await _graceful_kill(proc)
                 out.timed_out = True
         finally:
+            if soft is not None:
+                soft.cancel()
             if self.current_proc is proc:
                 self.current_proc = None
         return out

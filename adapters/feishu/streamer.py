@@ -31,7 +31,7 @@ class FeishuStreamer(StreamerBase):
         self.message_id = message_id
 
     def _assemble(self, skip: int, text: str) -> str:
-        parts = []
+        parts = [self.banner] if self.banner else []
         if self.steps:
             kept = self.steps[skip:]
             head = f"**📋 已完成 {len(self.steps)} 步**"

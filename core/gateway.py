@@ -10,19 +10,27 @@ adapter 收到平台消息 → 构造 InboundMessage → await gateway.handle(in
 等旧轮彻底退干净才开跑。旧轮进程还没 spawn 时 stop() 是 no-op,靠 epoch 兜住 —— 这正是
 「抢跑窗口」(handle 进来到 subprocess 起来之间隔着一次发卡片的网络往返)的堵法。
 被抢占的那轮不许静默收尾:半截内容留在卡片上但显式标注中断,否则半截答案会冒充完整答案。
+
+例外:有任务在跑时,「好了吗 / 进度呢」这类进度询问(core/progress_query.py)不抢占 ——
+网关直接回进度、不 spawn claude。问一句进度就把半小时的渲染杀掉,是最不该发生的抢占。
 """
 import asyncio
 import os
+import time
+
+from core.progress_query import is_progress_query, progress_reply, _fmt_elapsed
 
 
 class _RunSlot:
     """每个 conv_id 一个:串行锁 + 轮次号 + 作废原因。"""
-    __slots__ = ("lock", "epoch", "note")
+    __slots__ = ("lock", "epoch", "note", "started_at", "streamer")
 
     def __init__(self):
         self.lock = asyncio.Lock()
         self.epoch = 0
         self.note = ""
+        self.started_at: float | None = None    # 在跑那轮的开始时刻(monotonic);空闲为 None
+        self.streamer = None                    # 在跑那轮的 streamer,进度询问从它读当前步骤
 
     def bump(self, note: str) -> int:
         """作废当前在跑的那轮,返回新轮次号。"""
@@ -96,6 +104,13 @@ class Gateway:
                 self.sessions.persist(inbound.conv_id)
                 return
 
+        # 有任务在跑时问进度 → 直接回进度,不抢占(见模块 docstring 的「例外」)
+        if slot.lock.locked() and not inbound.images and is_progress_query(inbound.text):
+            elapsed = time.monotonic() - (slot.started_at or time.monotonic())
+            await self.adapter.send_text(inbound.conv_id, inbound.chat_type,
+                                         progress_reply(elapsed, slot.streamer))
+            return
+
         # 抢占上一轮:先作废(没 spawn 的靠 epoch 自己退)再杀(已 spawn 的立刻断流)
         my_epoch = slot.bump(self.PREEMPT_NOTE)
         if slot.lock.locked():
@@ -110,41 +125,61 @@ class Gateway:
                 return                      # 等锁期间又被更新的消息抢占,本轮直接作废
 
             streamer = self.adapter.make_streamer(inbound)
+            slot.started_at = time.monotonic()
+            slot.streamer = streamer
             try:
-                await streamer.first_frame()
-            except Exception:
-                pass
-            # 发卡片是一次网络往返,这期间可能又来消息 —— spawn 前最后一道闸
-            if my_epoch != slot.epoch:
-                await streamer.interrupted(slot.note)
-                return
-
-            try:
-                if inbound.images:
-                    resp = await backend.run_with_image(
-                        inbound.images[0], inbound.text or "请描述这张图片的内容", streamer)
-                else:
-                    resp = await backend.run(inbound.text, streamer)
-            except Exception as e:
-                await streamer.finalize(fallback=f"❌ 出错了：{e}")
-                return
+                await self._run_turn(inbound, backend, slot, my_epoch, streamer)
             finally:
-                # 本轮会话指针落盘:成功失败都落——异常路径往往也已拿到新 session_id,
-                # 不落盘的话进程一重启就接不回,正是「bot 突然失忆」的来源之一。
-                # 被抢占那轮同样要落:它的 session_id 就是下一轮 --resume 要接的那条。
-                self.sessions.persist(inbound.conv_id)
+                slot.started_at = None
+                slot.streamer = None
 
-            # 被抢占 → backend.run 是被杀出来的,resp 为空,不能按正常收尾冒充完整答案
-            if my_epoch != slot.epoch:
-                await streamer.interrupted(slot.note)
-                return
+    async def _run_turn(self, inbound, backend, slot, my_epoch, streamer):
+        """持锁执行一轮(handle 已登记 started_at/streamer 供进度询问读取)。"""
+        try:
+            await streamer.first_frame()
+        except Exception:
+            pass
+        # 发卡片是一次网络往返,这期间可能又来消息 —— spawn 前最后一道闸
+        if my_epoch != slot.epoch:
+            await streamer.interrupted(slot.note)
+            return
 
-            # bot 间接力(群聊 + 开启 relay + 平台支持):已另发带 <at> 的独立消息 → 撤回流式卡片,只留一条
-            if await self.relay.maybe_relay(inbound, resp, self.adapter):
-                await streamer.discard()
+        try:
+            if inbound.images:
+                resp = await backend.run_with_image(
+                    inbound.images[0], inbound.text or "请描述这张图片的内容", streamer)
             else:
-                await streamer.finalize(fallback=resp)
-                # 文字收尾后再追一条语音。发射即忘:TTS 是秒级阻塞(短句 ~4s),
-                # 挂在这里会把 slot 锁一直攥着,下一条消息得干等语音合成完 —— 那比没有语音更难受。
-                # 只走正常收尾这一支:被抢占/被 /stop 的半截回复不该被念出来。
-                self._spawn_voice(inbound, streamer.text or resp)
+                resp = await backend.run(inbound.text, streamer)
+        except Exception as e:
+            await streamer.finalize(fallback=f"❌ 出错了：{e}")
+            return
+        finally:
+            # 本轮会话指针落盘:成功失败都落——异常路径往往也已拿到新 session_id,
+            # 不落盘的话进程一重启就接不回,正是「bot 突然失忆」的来源之一。
+            # 被抢占那轮同样要落:它的 session_id 就是下一轮 --resume 要接的那条。
+            self.sessions.persist(inbound.conv_id)
+
+        # 被抢占 → backend.run 是被杀出来的,resp 为空,不能按正常收尾冒充完整答案
+        if my_epoch != slot.epoch:
+            await streamer.interrupted(slot.note)
+            return
+
+        # bot 间接力(群聊 + 开启 relay + 平台支持):已另发带 <at> 的独立消息 → 撤回流式卡片,只留一条
+        if await self.relay.maybe_relay(inbound, resp, self.adapter):
+            await streamer.discard()
+        else:
+            await streamer.finalize(fallback=resp)
+            # 文字收尾后再追一条语音。发射即忘:TTS 是秒级阻塞(短句 ~4s),
+            # 挂在这里会把 slot 锁一直攥着,下一条消息得干等语音合成完 —— 那比没有语音更难受。
+            # 只走正常收尾这一支:被抢占/被 /stop 的半截回复不该被念出来。
+            self._spawn_voice(inbound, streamer.text or resp)
+
+        # 跑过软上限的长任务:卡片是原地更新的,手机上不会再响 → 另发一条新消息提醒
+        if getattr(backend, "last_run_went_long", False):
+            elapsed = time.monotonic() - (slot.started_at or time.monotonic())
+            try:
+                await self.adapter.send_text(
+                    inbound.conv_id, inbound.chat_type,
+                    f"🔔 刚才那个跑了 {_fmt_elapsed(elapsed)} 的任务结束了，结果见上面的卡片。")
+            except Exception as e:
+                print(f"[WARN] 长任务完成提醒发送失败:{e}")
