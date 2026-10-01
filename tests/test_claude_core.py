@@ -338,3 +338,54 @@ class TestStreamStalledFlag:
 
     def test_outcome_defaults(self):
         assert cc._RunOutcome().stalled_in_tool is False
+
+
+# ---------- 流卡死自动续接 ----------
+
+class TestRetryOnStall:
+    def _session(self, tmp_home, outcomes):
+        sid = str(uuid.uuid4())
+        _make_session_file(tmp_home, sid)
+        s = cc.ClaudeSession(cwd="/tmp")
+        s.new_session = False
+        s.current_session_id = sid
+        calls = []
+
+        async def fake_execute(cmd, history_prompt, streamer, stdin_payload=None):
+            calls.append(cmd)
+            return outcomes.pop(0)
+        s._execute = fake_execute
+        return s, sid, calls
+
+    def test_api_stall_retries_with_resume(self, tmp_home):
+        s, sid, calls = self._session(tmp_home, [cc._RunOutcome(text="好了")])
+        out = asyncio.run(s._retry_on_stall(cc._RunOutcome(stalled=True), None))
+        assert out.text == "好了" and out.stall_retries == 1
+        assert len(calls) == 1
+        assert calls[0][calls[0].index("--resume") + 1] == sid
+        assert cc._STALL_CONTINUE_PROMPT in calls[0]
+
+    def test_gives_up_after_limit(self, tmp_home, monkeypatch):
+        monkeypatch.setattr(cc, "_STALL_RETRIES", 1)
+        s, _, calls = self._session(tmp_home, [cc._RunOutcome(stalled=True)])
+        out = asyncio.run(s._retry_on_stall(cc._RunOutcome(stalled=True), None))
+        assert out.stalled and out.stall_retries == 1 and len(calls) == 1
+        msg = asyncio.run(s._settle(out, None))
+        assert "已自动重试 1 次仍失败" in msg
+
+    def test_tool_stall_not_retried(self, tmp_home):
+        s, _, calls = self._session(tmp_home, [])
+        out = asyncio.run(s._retry_on_stall(cc._RunOutcome(stalled=True, stalled_in_tool=True), None))
+        assert out.stall_retries == 0 and calls == []
+
+    def test_disabled_when_zero(self, tmp_home, monkeypatch):
+        monkeypatch.setattr(cc, "_STALL_RETRIES", 0)
+        s, _, calls = self._session(tmp_home, [])
+        asyncio.run(s._retry_on_stall(cc._RunOutcome(stalled=True), None))
+        assert calls == []
+
+    def test_no_session_file_no_retry(self, tmp_home):
+        s = cc.ClaudeSession(cwd="/tmp")
+        s.current_session_id = "missing"
+        out = asyncio.run(s._retry_on_stall(cc._RunOutcome(stalled=True), None))
+        assert out.stall_retries == 0

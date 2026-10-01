@@ -60,6 +60,11 @@ _PARTIAL_FLAG = (["--include-partial-messages"]
 # 思考深度上限（token）。Opus 高强度扩展思考会跑几分钟，飞书上看着像卡死。
 # 给一个上限让响应保持迅捷；可用 CLAUDE_MAX_THINKING 调整，设 "0" 取消上限。
 _MAX_THINKING = os.environ.get("CLAUDE_MAX_THINKING", "8000").strip()
+# 等 API 时流断（非工具执行中）自动续接的次数。出口隧道偶发半路断流（实测一天几十次
+# 探活失败），每次都让用户手动重发太烦；断流时会话最后一条是完整的 tool_result，
+# 用 --resume 补一句「继续」就能从断点接上。设 0 关闭。可用 CLAUDE_STALL_RETRIES 覆盖。
+_STALL_RETRIES = max(0, int(os.environ.get("CLAUDE_STALL_RETRIES", "1")))
+_STALL_CONTINUE_PROMPT = "（上一轮 API 流中断，网关已自动重连）请从中断处接着继续，不要重复已完成的步骤。"
 _STALL_MSG = f"⚠️ 模型响应卡住了（{_STALL_TIMEOUT}s 无任何输出），已中断。多半是 API 流中断。{_RETRY_NOTE}"
 _TOOL_STALL_MSG = (f"⚠️ 某个工具跑了 {_TOOL_STALL_TIMEOUT // 60} 分钟还没吭声，已中断。"
                    f"长任务请让我用 detach-run 甩到后台，别在对话里干等。{_RETRY_NOTE}")
@@ -83,6 +88,7 @@ class _RunOutcome:
     stalled: bool = False
     stalled_in_tool: bool = False
     timed_out: bool = False
+    stall_retries: int = 0     # 已自动续接的次数（见 _retry_on_stall）
 
 
 def _tool_delta(event: dict) -> int:
@@ -885,6 +891,8 @@ class ClaudeSession:
             what = "工具执行" if out.stalled_in_tool else "流"
             print(f"\n🛑 {what}卡死（{secs}s 无输出），已中断，会话保留")
             msg = _TOOL_STALL_MSG if out.stalled_in_tool else _STALL_MSG
+            if out.stall_retries:
+                msg = msg.replace("已中断。", f"已自动重试 {out.stall_retries} 次仍失败，已中断。", 1)
             await _notify(msg)
             return msg
         if out.timed_out:
@@ -923,6 +931,38 @@ class ClaudeSession:
             self.last_good_session_id = self.current_session_id
         return (out.text or "").strip()
 
+    async def _retry_on_stall(self, out: _RunOutcome, streamer) -> _RunOutcome:
+        """等 API 时流断 → 在原会话里自动补一句「继续」，最多 _STALL_RETRIES 次。
+
+        只管 API 流断：工具跑太久（stalled_in_tool）重试只会再卡一遍，照旧交给用户。
+        文本/图片两条路径共用，重试一律走纯文本 prompt（图片已在会话历史里）。
+        """
+        while (out.stalled and not out.stalled_in_tool
+               and out.stall_retries < _STALL_RETRIES):
+            sid = self.current_session_id
+            if not sid or not _session_file_exists(sid):
+                return out
+            n = out.stall_retries + 1
+            print(f"\n🔁 流卡死，自动续接第 {n} 次（会话 {sid[:8]}）", flush=True)
+            if streamer is not None:
+                try:
+                    if getattr(streamer, "has_content", False):
+                        await streamer.append(f"\n\n🔁 API 流中断，已自动重连接着跑（第 {n} 次）…\n\n")
+                    else:
+                        await streamer.set_status(f"🔁 API 流中断，自动重连中（第 {n} 次）…")
+                except Exception:
+                    pass
+            cmd = (
+                self._build_cmd_prefix()
+                + self.build_session_flags()
+                + ["--output-format", "stream-json"]
+                + _PARTIAL_FLAG
+                + ["--verbose", "-p", _STALL_CONTINUE_PROMPT]
+            )
+            out = await self._execute(cmd, _STALL_CONTINUE_PROMPT, streamer)
+            out.stall_retries = n
+        return out
+
     async def run_claude(self, prompt: str, streamer=None) -> str:
         print(f"\n{'─' * 60}")
         print(f"📱  {prompt}")
@@ -941,6 +981,7 @@ class ClaudeSession:
         self.resume_session_id = None  # 用一次即清，后续钉住 current_session_id 续接
 
         out = await self._execute(cmd, prompt, streamer)
+        out = await self._retry_on_stall(out, streamer)
         return await self._settle(out, streamer)
 
     async def run_claude_with_image(self, image_path: str, caption: str, streamer=None) -> str:
@@ -979,4 +1020,5 @@ class ClaudeSession:
         self.resume_session_id = None
 
         out = await self._execute(cmd, prompt_text, streamer, stdin_payload=stdin_payload)
+        out = await self._retry_on_stall(out, streamer)
         return await self._settle(out, streamer)
