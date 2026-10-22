@@ -4,13 +4,16 @@ import os
 
 def load_bot_persona() -> str:
     """加载本 bot 人设,作为 --append-system-prompt 注入。
-    优先级:BOT_PERSONA(内联) > BOT_PERSONA_FILE(角色 .md,自动去 YAML frontmatter)。"""
+    优先级:BOT_PERSONA(内联) > BOT_PERSONA_FILE(角色 .md,自动去 YAML frontmatter)。
+    BOT_PERSONA_FILE 可用逗号分隔多个文件(如 角色 agent.md + 本 bot 记忆纪律),按顺序拼接。"""
     inline = os.environ.get("BOT_PERSONA", "").strip()
     if inline:
         return inline
-    path = os.environ.get("BOT_PERSONA_FILE", "").strip()
-    if not path:
-        return ""
+    paths = [p.strip() for p in os.environ.get("BOT_PERSONA_FILE", "").split(",") if p.strip()]
+    return "\n\n---\n\n".join(t for t in (_read_persona_file(p) for p in paths) if t)
+
+
+def _read_persona_file(path: str) -> str:
     path = os.path.expanduser(path)
     try:
         with open(path, encoding="utf-8") as f:

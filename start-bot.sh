@@ -29,6 +29,7 @@ export BOT_PLATFORM="${BOT_PLATFORM:-feishu}"      # 默认飞书;.env 可覆盖
 set +a
 
 # 优先用仓库内 venv，没有则回退系统 python3
+export PYTHONUNBUFFERED=1
 PYTHON="$SCRIPT_DIR/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="python3"
 

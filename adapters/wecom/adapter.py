@@ -14,7 +14,7 @@ from core.messages import InboundMessage
 from adapters.base import PlatformAdapter
 from .streamer import WecomStreamer
 
-# 企微长连接需直连(websockets 会读 HTTPS_PROXY 走代理被重置)
+# 企微长连接需直连(websockets 会读 HTTPS_PROXY 走代理被重置;15.x 还会读 macOS 系统代理,connect 处另传 proxy=None)
 for _pk in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
     os.environ.pop(_pk, None)
 
@@ -80,7 +80,7 @@ class WecomAdapter(PlatformAdapter):
         backoff = 2
         while True:
             try:
-                async with websockets.connect(self.ws_url, ping_interval=None, ping_timeout=None,
+                async with websockets.connect(self.ws_url, proxy=None, ping_interval=None, ping_timeout=None,
                                                max_size=4 * 1024 * 1024) as ws:
                     self.ws = ws
                     await self._ws_send(self._frame_subscribe())

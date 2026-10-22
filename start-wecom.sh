@@ -25,6 +25,7 @@ source "$ENV_FILE"
 export BOT_PLATFORM="${BOT_PLATFORM:-wecom}"       # 默认企微;.env 可覆盖
 set +a
 
+export PYTHONUNBUFFERED=1
 PYTHON="$SCRIPT_DIR/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="python3"
 
