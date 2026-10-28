@@ -58,7 +58,7 @@ fi
 ENV_FILE="$REPO/.env.$ROLE"
 [ -e "$ENV_FILE" ] && { cp "$ENV_FILE" "$ENV_FILE.bak"; echo "⚠️  $ENV_FILE 已存在，备份为 .bak"; }
 {
-    echo "# 角色 bot：$BOT_NAME（new-agent.sh 生成）"
+    echo "# 角色 bot：${BOT_NAME}（new-agent.sh 生成）"
     echo "FEISHU_APP_ID=$APP_ID"
     echo "FEISHU_APP_SECRET=$APP_SECRET"
     echo "FEISHU_VERIFY_TOKEN="

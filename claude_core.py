@@ -634,6 +634,16 @@ async def _dispatch_event(event: dict, streamer):
             pass
 
 
+
+def _log_prompt(prompt: str) -> str:
+    """日志里不打印每轮注入块（角色记忆几 KB，一天几十轮会把 bot 日志撑爆），只留用户原话。"""
+    close = "[每轮注入 · 结束]"
+    i = prompt.find(close)
+    if i < 0:
+        return prompt
+    return f"[每轮注入 {i} 字已省略] " + prompt[i + len(close):].strip()
+
+
 class ClaudeSession:
     """每个用户/渠道独立的 Claude 会话状态管理"""
 
@@ -965,7 +975,7 @@ class ClaudeSession:
 
     async def run_claude(self, prompt: str, streamer=None) -> str:
         print(f"\n{'─' * 60}")
-        print(f"📱  {prompt}")
+        print(f"📱  {_log_prompt(prompt)}")
         print(f"{'─' * 60}\n")
         sys.stdout.flush()
 

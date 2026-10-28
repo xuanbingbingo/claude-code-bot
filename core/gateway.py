@@ -88,6 +88,12 @@ class Gateway:
     async def handle(self, inbound):
         backend = self.sessions.get_or_create(inbound.conv_id, inbound.is_group)
         slot = self._slot(inbound.conv_id)
+        note = self.sessions.pop_reset_note() if hasattr(self.sessions, "pop_reset_note") else ""
+        if note:
+            try:
+                await self.adapter.send_text(inbound.conv_id, inbound.chat_type, note)
+            except Exception as e:
+                print(f"[WARN] 人设更新提示发送失败:{e}")
 
         # 平台环境注入(飞书 send-file 需要发起人 id + bot 凭证;其他平台默认空)
         env = self.adapter.backend_env(inbound)

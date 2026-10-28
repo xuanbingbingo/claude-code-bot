@@ -498,6 +498,28 @@ bash scripts/new-agent.sh researcher cli_xxx secret_yyy ~/.claude/agents/researc
 
 ---
 
+## 角色记忆体系（2026-10-24 重构：网关统一注入）
+
+角色 bot（`.env.<role>` 里设 `BOT_ROLE=<role>`，或 `BOT_PERSONA_FILE` 含 `~/aiProjects/bots/<role>/persona.md`）接入统一的记忆体系，代码在 `core/memory.py`，配置在 `~/aiProjects/bots/_shared/roles.json`：
+
+| 层 | 文件 | 谁能看 | 怎么写 |
+|---|---|---|---|
+| 私有记忆 | `bots/<role>/memory.md`（分「长期事实」「流水」两段） | 只有该角色（飞书 / 运转台 / 定时任务共用同一份） | `bots/memo.py note <role> "…" --public "一句话"` |
+| 公共记忆 | `bots/_shared/memory.md` | 所有角色 | `memo.py note` 默认同步一句话摘要；`--private-only` 不进；老板明说广播用 `memo.py public` |
+| 各部门摘要 | 由程序拼 | 只有 `reads_all: true` 的角色（CEO） | 不用写 |
+
+**三条硬规则（都是踩过坑的）**
+
+1. **记忆内容每轮拼进用户消息，不放 `--append-system-prompt`。** 实测 `claude -p --resume` 只认会话首轮的系统提示，之后传的全被忽略；续接会话里模型也不会再去 Read 文件。`ClaudeCodeBackend(turn_prefix=…)` 每轮把 `memory.wrap_turn(role, prompt)` 拼在前面，日志里只打印用户原话。
+2. **纪律由网关生成，persona.md 只写身份。** 「读 / 写 / 文件结构 / 发文件 / 个人记忆库」五节纪律是 `memory.discipline(role, where)`，按 roles.json 的 `remember` / `extra` 填参数；运转台（ceo-agent）调同一个函数。改纪律改一处，17 个角色一起生效。
+3. **人设文件变了自动开新会话。** `SessionManager(stamp_fn=…)` 每条消息比对人设文件 + roles.json 的 mtime 指纹，变了就换新 backend、作废旧会话指针，并提示用户「人设已更新，已开新会话」。
+
+**记忆衰减**：`bots/memory_tidy.py` 每晚由 ceo-agent `nightly` 调用——流水里早于 `keep_days`（45）的归档到 `bots/<role>/archive/YYYY-MM.md`（只增不删），归档的条目分块喂 sonnet，只让它输出「长期事实里还没有的」新条目追加进去，不改写已有事实。`--dry` 只报告，`--migrate` 只转格式。
+
+**跨渠道对话摘要**：记忆文件共享不等于聊天记录共享——老板在飞书跟 CEO 聊的，运转台里的 CEO 原本看不到。所以每轮结束由程序往 `bots/<role>/chatlog.jsonl` 记一行（时间 / 渠道 / 老板说 / 我答，截断，滚动留 200 轮），`memory.wrap_turn` 把最近十来轮按时间排好一并注入；`ClaudeCodeBackend(turn_log=…)`、ceo-agent `chat.py`、`bot-cron.py` 三处都写。老板问「我上次跟你聊了什么」靠这个，不靠模型自觉记。
+
+定时任务 `tools/bot-cron.py` 同样读 `BOT_ROLE`，纪律进系统提示、记忆拼进 prompt，和对话里行为一致。
+
 ## macOS 7×24 部署（防睡眠 + 长任务超时）
 
 把网关挂在 Mac 上长期跑、用手机远程时，有两个坑会导致「手机端能收到但回复到一半就断」：

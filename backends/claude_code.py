@@ -10,19 +10,44 @@ from .base import (AgentBackend, CAP_SESSIONS, CAP_IMAGES, CAP_SUBAGENTS,
 class ClaudeCodeBackend(AgentBackend):
     capabilities = {CAP_SESSIONS, CAP_IMAGES, CAP_SUBAGENTS, CAP_CWD, CAP_MODEL, CAP_MODE, CAP_STOP}
 
-    def __init__(self, cwd: str | None = None, append_prompt: str = "", base_env: dict | None = None):
+    def __init__(self, cwd: str | None = None, append_prompt: str = "", base_env: dict | None = None, turn_prefix=None, turn_log=None):
         self.session = cc.ClaudeSession(cwd=cwd)
+        # 每轮注入:角色记忆等「会变的上下文」拼进用户消息。🔴 不能放 append_prompt:
+        # --resume 只认首轮的 --append-system-prompt,之后传的全被忽略(10-24 实测)。
+        self._turn_prefix = turn_prefix
+        self._turn_log = turn_log            # (user_text, assistant_text) -> None,跨渠道对话摘要
         if append_prompt:
             self.session.extra_append_prompt = append_prompt
         if base_env:
             self.session.extra_env.update(base_env)
 
     # ---- 执行 ----
+    def _wrap(self, prompt: str) -> str:
+        if not self._turn_prefix:
+            return prompt
+        try:
+            return self._turn_prefix(prompt)
+        except Exception as e:          # 记忆文件读不到不能把对话搞挂
+            print(f"[WARN] 每轮注入失败,本轮不带记忆:{e}")
+            return prompt
+
+    def _log(self, user_text: str, resp: str) -> None:
+        if self._turn_log and resp:
+            try:
+                self._turn_log(user_text, resp)
+            except Exception as e:
+                print(f"[WARN] 对话摘要记录失败:{e}")
+
     async def run(self, prompt: str, streamer) -> str:
-        return await self.session.run_claude(prompt, streamer)
+        resp = await self.session.run_claude(self._wrap(prompt), streamer)
+        self._log(prompt, resp)
+        return resp
 
     async def run_with_image(self, image_path: str, caption: str, streamer) -> str:
-        return await self.session.run_claude_with_image(image_path, caption, streamer)
+        caption = caption or "请描述这张图片的内容"
+        resp = await self.session.run_claude_with_image(image_path, self._wrap(caption), streamer)
+        self._log("[图片] " + caption, resp)
+        return resp
 
     # ---- 平台环境注入(飞书 send-file 用)----
     def inject_env(self, env: dict) -> None:

@@ -57,18 +57,23 @@ def main():
     os.environ.update(load_env_file(os.path.join(ROOT, f".env.{args.role}")))
     from core.persona import load_bot_persona
     from core.runtime_rules import RUNTIME_RULES
+    from core import memory as role_memory
     from adapters.feishu.api import FeishuAPI
+    role = role_memory.role_from_env()
 
     app_id, secret = os.environ["FEISHU_APP_ID"], os.environ["FEISHU_APP_SECRET"]
     id_type = "chat_id" if args.to.startswith("oc_") else "open_id"
     tool = os.path.join(ROOT, "tools", "feishu-send-file.py")
     append = "\n\n".join(p for p in (
         load_bot_persona(),
+        role_memory.discipline(role, where="定时任务") if role else "",
         f"你运行在飞书机器人网关里(本轮是定时任务触发,最终回复会自动推送给用户)。"
         f"要把本地文件/图片/视频发到飞书,直接执行:\n    python3 {tool} <文件绝对路径>",
         RUNTIME_RULES) if p)
     with open(os.path.expanduser(args.prompt_file), encoding="utf-8") as f:
         prompt = f.read().strip()
+    if role:   # 角色记忆每轮注入(和网关对话里一致;--resume 续接时系统提示不更新,所以放 prompt 里)
+        prompt = role_memory.wrap_turn(role, prompt)
 
     cmd = (["claude", "-p", prompt, "--output-format", "json", "--dangerously-skip-permissions",
             "--append-system-prompt", append] + resume_args(app_id, args.to))
@@ -83,6 +88,11 @@ def main():
         text = f"⚠️ 定时任务失败:{e}"
     for i in range(0, len(text), CHUNK):
         api.send_card(args.to, text[i:i + CHUNK], receive_id_type=id_type)
+    if role:
+        try:
+            role_memory.log_turn(role, "定时任务", f"[{os.path.basename(args.prompt_file)}]", text)
+        except Exception as e:
+            print(f"[bot-cron] 对话摘要记录失败: {e}")
     print(f"[bot-cron] role={args.role} sent {len(text)} chars: {text[:200]!r}")
 
 

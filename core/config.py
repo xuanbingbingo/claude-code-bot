@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 
 from .persona import load_bot_persona
+from .memory import role_from_env
 
 
 def load_env(script_dir: str | None = None) -> None:
@@ -53,6 +54,8 @@ class BotConfig:
     voice_enabled: bool = True          # BOT_VOICE=0 关闭;默认开
     voice_name: str = ""                # BOT_VOICE_NAME,空=hfvoice 默认音色(清爽男声)
     voice_max_chars: int = 600          # BOT_VOICE_MAX_CHARS,超出截断并提示看文字
+    role: str = ""                      # BOT_ROLE:角色目录 bots/<role>(记忆体系);空=通用 bot 无记忆
+    persona_files: list = field(default_factory=list)  # 人设文件路径,用于人设变更指纹
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -72,4 +75,6 @@ class BotConfig:
             voice_enabled=os.environ.get("BOT_VOICE", "1").strip() not in ("0", "off", "false"),
             voice_name=os.environ.get("BOT_VOICE_NAME", "").strip(),
             voice_max_chars=_int_env("BOT_VOICE_MAX_CHARS", 600),
+            role=role_from_env(),
+            persona_files=[x.strip() for x in os.environ.get("BOT_PERSONA_FILE", "").split(",") if x.strip()],
         )

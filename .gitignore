@@ -40,3 +40,8 @@ roster-cache.json.lock
 # 会话指针持久化(含 open_id→session_id,按 app 隔离,本机运行时数据不入库)
 .sessions-*.json
 .sessions-*.json.*.tmp
+
+# 运行时数据（语音偏好 / 飞书收到的文件）
+.voice-cli_*.json
+inbox/
+*.log.*.gz

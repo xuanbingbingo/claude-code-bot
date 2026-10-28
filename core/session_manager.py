@@ -17,9 +17,14 @@ import threading
 
 
 class SessionManager:
-    def __init__(self, backend_factory, state_key: str = "", state_dir: str | None = None):
+    def __init__(self, backend_factory, state_key: str = "", state_dir: str | None = None, stamp_fn=None):
         self._backends: dict = {}
         self._factory = backend_factory
+        # stamp_fn() → 人设指纹字符串。--resume 续接的会话吃不到新人设(系统提示冻结在首轮),
+        # 所以人设文件一变,下一条消息就换新 backend 开新会话(10-24 用户定)。None=不检查。
+        self._stamp_fn = stamp_fn
+        self._stamps: dict[str, str] = {}
+        self.last_reset_note: str = ""
         self._lock = threading.Lock()
         self._pointers: dict[str, str] = {}      # conv_id -> session_id
         self._state_file: str | None = None
@@ -75,8 +80,16 @@ class SessionManager:
         # is_group 用于让 factory 决定是否注入群聊专属提示(如 relay 队友)。
         # 依赖不变式:conv_id 与会话类型稳定绑定(群 chat_id 恒群、单聊 open_id 恒单聊),
         # 故 backend 首建时按 is_group 定死人设即可,不会中途变类型。
+        stamp = self._current_stamp()
+        if conv_id in self._backends and stamp is not None and self._stamps.get(conv_id) not in (None, stamp):
+            print(f"[INFO] 人设/纪律已更新,会话 {conv_id[:12]} 开新会话以加载新人设")
+            self._backends.pop(conv_id, None)
+            self._pointers.pop(conv_id, None)      # 旧指针不能再接:接回去还是旧系统提示
+            self.last_reset_note = "🎭 人设已更新，已为你开了新会话"
         if conv_id not in self._backends:
             backend = self._factory(is_group)
+            if stamp is not None:
+                self._stamps[conv_id] = stamp
             # 重启恢复:该会话若有持久化指针且其 jsonl 仍在磁盘,自动接回重启前的会话;
             # jsonl 已删则照常开新会话(set_resume_session 不被调用)。后端不支持会话
             # (session_file_exists 默认 False,如 Hermes)时该分支天然跳过。
@@ -88,3 +101,15 @@ class SessionManager:
 
     def get(self, conv_id: str):
         return self._backends.get(conv_id)
+
+    def _current_stamp(self):
+        if not self._stamp_fn:
+            return None
+        try:
+            return self._stamp_fn()
+        except Exception:
+            return None
+
+    def pop_reset_note(self) -> str:
+        note, self.last_reset_note = self.last_reset_note, ""
+        return note

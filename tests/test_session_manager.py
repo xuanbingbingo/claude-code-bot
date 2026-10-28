@@ -124,3 +124,24 @@ def test_gateway_persists_pointer_even_on_exception(tmp_path):
     asyncio.run(gw.handle(_Inbound()))
     data = json.load(open(tmp_path / ".sessions-k.json"))
     assert data == {"conv1": "sid-from-crashed-run"}
+
+
+def test_persona_stamp_change_opens_new_session(tmp_path):
+    """人设文件变了 → 同一 conv 下一次 get_or_create 换新 backend(新会话),旧指针作废。"""
+    state = tmp_path / ".sessions-k.json"
+    state.write_text(json.dumps({"conv1": "sid-a"}))
+    stamp = {"v": "s1"}
+
+    def factory(is_group=False):
+        b = FakeBackend()
+        b._files = {"sid-a"}
+        return b
+
+    sm = SessionManager(factory, state_key="k", state_dir=str(tmp_path), stamp_fn=lambda: stamp["v"])
+    b1 = sm.get_or_create("conv1")
+    assert b1.resumed_with == "sid-a"
+    assert sm.get_or_create("conv1") is b1          # 没变:同一个
+    stamp["v"] = "s2"
+    b2 = sm.get_or_create("conv1")
+    assert b2 is not b1 and b2.resumed_with is None  # 变了:新 backend,且不再 resume 旧会话
+    assert sm.pop_reset_note() and sm.pop_reset_note() == ""
