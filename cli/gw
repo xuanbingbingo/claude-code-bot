@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""gw — claude-gateway bot 运维命令（人和 agent 都能用）。
+
+自动发现：.env.<role> 文件 + ~/Library/LaunchAgents/*.plist（ProgramArguments 指向本仓库
+start-bot.sh / start-wecom.sh / tools/bot-cron.py 的）+ `launchctl list`。不再写死角色清单。
+
+约定（agent 接入）：
+  - 读命令加 --json：stdout 只有一份 JSON，日志/提示走 stderr
+  - JSON 顶层恒有 ok 字段；命令本身失败退出码 1（ok=false, error=...）
+  - doctor 发现 error 级问题退出码 2（ok=true, healthy=false）
+  - restart 支持 --dry-run；--help 无副作用
+  - `gw capabilities --json` 自描述
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+# cli/gw 可能经 ~/.local/bin/gw 软链调用，resolve 后回到仓库根
+REPO = Path(os.environ.get("GW_REPO") or Path(__file__).resolve().parent.parent)
+AGENTS_DIR = Path(os.environ.get("GW_LAUNCH_AGENTS") or Path.home() / "Library/LaunchAgents")
+UID = os.getuid()
+
+ENV_RE = re.compile(r"^\.env\.([A-Za-z0-9_-]+)$")
+ENV_SKIP = {"example", "role.example", "wecom.role.example"}
+ERR_RE = re.compile(r"traceback|\[error\]|\berror\b|exception|❌|failed|fatal|refused", re.I)
+RETIRED_PORTS = [8888]          # AntProxy 8888 已退役（见 reference_anthropic_relay_loopback_forward）
+HUGE_LOG_BYTES = 200 * 1024 * 1024
+STALE_LOG_S = 24 * 3600
+
+
+# ───────────────────────── 输出工具 ─────────────────────────
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def emit_json(obj, code=0):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+    sys.exit(code)
+
+
+def fail(msg, as_json, code=1, **extra):
+    if as_json:
+        emit_json({"ok": False, "error": msg, **extra}, code)
+    eprint(f"❌ {msg}")
+    sys.exit(code)
+
+
+def run(cmd, timeout=15):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:  # noqa: BLE001
+        return 127, "", str(e)
+
+
+# ───────────────────────── 发现 ─────────────────────────
+def launchctl_list():
+    """label -> (pid|None, last_exit|None)"""
+    out = {}
+    _, so, _ = run(["launchctl", "list"])
+    for line in so.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        pid, st, label = parts
+        out[label] = (int(pid) if pid.strip() not in ("-", "") else None,
+                      int(st) if st.strip().lstrip("-").isdigit() else None)
+    return out
+
+
+def launchctl_print(label):
+    """runs / state / last exit code（launchctl print 的人类格式，尽力解析）"""
+    rc, so, _ = run(["launchctl", "print", f"gui/{UID}/{label}"], timeout=5)
+    if rc != 0:
+        return {}
+    info = {}
+    m = re.search(r"^\s*runs = (\d+)", so, re.M)
+    if m:
+        info["runs"] = int(m.group(1))
+    m = re.search(r"^\s*state = (\S+)", so, re.M)
+    if m:
+        info["state"] = m.group(1)
+    m = re.search(r"^\s*last exit code = (.+)$", so, re.M)
+    if m:
+        info["last_exit_detail"] = m.group(1).strip()
+    return info
+
+
+def proc_uptime_s(pid):
+    rc, so, _ = run(["ps", "-o", "etime=", "-p", str(pid)])
+    s = so.strip()
+    if rc != 0 or not s:
+        return None
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    nums = [int(x) for x in s.split(":")]
+    while len(nums) < 3:
+        nums.insert(0, 0)
+    h, m, sec = nums
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def role_processes():
+    """role -> [pid,...] 当前在跑的 start-bot.sh / start-wecom.sh 进程（用于发现重复/野进程）"""
+    _, so, _ = run(["ps", "-axo", "pid=,command="])
+    out = {}
+    for line in so.splitlines():
+        line = line.strip()
+        m = re.match(r"(\d+)\s+.*?(start-bot\.sh|start-wecom\.sh)\s+(\S+)\s*$", line)
+        if not m:
+            continue
+        role = m.group(3) if m.group(2) == "start-bot.sh" else f"wecom-{m.group(3)}"
+        out.setdefault(role, []).append(int(m.group(1)))
+    return out
+
+
+def parse_plist(path):
+    try:
+        with open(path, "rb") as f:
+            d = plistlib.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    args = d.get("ProgramArguments") or ([d["Program"]] if d.get("Program") else [])
+    joined = " ".join(map(str, args))
+    if str(REPO) not in joined and str(REPO) != d.get("WorkingDirectory"):
+        return None
+    kind, role = None, None
+    for i, a in enumerate(args):
+        a = str(a)
+        if a.endswith("start-bot.sh") and i + 1 < len(args):
+            kind, role = "bot", str(args[i + 1])
+        elif a.endswith("start-wecom.sh") and i + 1 < len(args):
+            kind, role = "bot", f"wecom-{args[i + 1]}"
+        elif a.endswith("bot-cron.py"):
+            kind = "cron"
+            if "--role" in args:
+                role = str(args[args.index("--role") + 1])
+    if not kind:
+        kind = "other"
+    return {
+        "label": d.get("Label"),
+        "plist": str(path),
+        "kind": kind,
+        "role": role,
+        "keepalive": bool(d.get("KeepAlive")),
+        "schedule": d.get("StartCalendarInterval"),
+        "stderr_path": d.get("StandardErrorPath"),
+        "stdout_path": d.get("StandardOutPath"),
+    }
+
+
+def env_roles():
+    roles = {}
+    for p in sorted(REPO.glob(".env.*")):
+        m = ENV_RE.match(p.name)
+        if not m or m.group(1) in ENV_SKIP:
+            continue
+        roles[m.group(1)] = str(p)
+    return roles
+
+
+def file_info(path):
+    if not path or not os.path.exists(path):
+        return None, None
+    st = os.stat(path)
+    return st.st_mtime, st.st_size
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts)) if ts else None
+
+
+def discover(include_cron=True, deep=False):
+    envs = env_roles()
+    ll = launchctl_list()
+    plists = []
+    for p in sorted(AGENTS_DIR.glob("*.plist")):
+        info = parse_plist(p)
+        if info:
+            plists.append(info)
+    entries = []
+    seen_roles = set()
+    for pl in plists:
+        if pl["kind"] == "cron" and not include_cron:
+            continue
+        role = pl["role"]
+        pid, last_exit = ll.get(pl["label"], (None, None))
+        loaded = pl["label"] in ll
+        e = {
+            "role": role,
+            "kind": pl["kind"],
+            "label": pl["label"],
+            "plist": pl["plist"],
+            "loaded": loaded,
+            "running": pid is not None,
+            "pid": pid,
+            "last_exit": last_exit,
+            "keepalive": pl["keepalive"],
+            "env": None,
+            "log": None,
+            "stderr_log": pl["stderr_path"],
+        }
+        if pl["kind"] == "bot":
+            seen_roles.add(role)
+            e["env"] = envs.get(role)
+            e["log"] = str(REPO / f"bot-{role}.log")
+        elif pl["kind"] == "cron":
+            e["env"] = envs.get(role)
+            e["log"] = pl["stdout_path"] or pl["stderr_path"]
+            e["schedule"] = pl["schedule"]
+        entries.append(e)
+    # 只有 .env、没有 plist 的角色
+    for role, env in envs.items():
+        if role in seen_roles:
+            continue
+        entries.append({
+            "role": role, "kind": "bot", "label": None, "plist": None,
+            "loaded": False, "running": False, "pid": None, "last_exit": None,
+            "keepalive": False, "env": env, "log": str(REPO / f"bot-{role}.log"),
+            "stderr_log": None,
+        })
+    for e in entries:
+        mt, sz = file_info(e["log"])
+        e["log_mtime"] = iso(mt)
+        e["log_age_s"] = int(time.time() - mt) if mt else None
+        e["log_bytes"] = sz
+        if deep and e["label"] and e["loaded"]:
+            lp = launchctl_print(e["label"])
+            e["runs"] = lp.get("runs")
+            e["uptime_s"] = proc_uptime_s(e["pid"]) if e["pid"] else None
+    entries.sort(key=lambda x: (x["kind"] != "bot", x["role"] or "", x["label"] or ""))
+    return entries
+
+
+def find(entries, key):
+    hits = [e for e in entries if key in (e["role"], e["label"])]
+    if not hits:  # 宽松：label 后缀
+        hits = [e for e in entries if e["label"] and e["label"].endswith("." + key)]
+    bots = [h for h in hits if h["kind"] == "bot"]
+    return bots[0] if bots else (hits[0] if hits else None)
+
+
+# ───────────────────────── 日志 ─────────────────────────
+def tail_lines(path, n, max_bytes=8 * 1024 * 1024):
+    """从文件尾读 n 行（日志可能几百 MB，只 seek 尾部）"""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        block, data = 64 * 1024, b""
+        pos = size
+        while pos > 0 and data.count(b"\n") <= n and size - pos < max_bytes:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step) + data
+    lines = data.decode("utf-8", "replace").splitlines()
+    return lines[-n:]
+
+
+def is_err_line(line):
+    s = line.lstrip()
+    if s.startswith("{"):     # claude stream-json 输出，内容里的 error 字样不算
+        return False
+    return bool(ERR_RE.search(s))
+
+
+def error_summary(e, scan=400, keep=8):
+    lines = [l for l in tail_lines(e["log"], scan) if is_err_line(l)]
+    stderr_lines = [l for l in tail_lines(e.get("stderr_log"), 50) if l.strip()] if e.get("stderr_log") else []
+    return {
+        "scanned_lines": scan,
+        "error_count": len(lines),
+        "recent_errors": [l[:300] for l in lines[-keep:]],
+        "stderr_log_tail": [l[:300] for l in stderr_lines[-5:]],
+    }
+
+
+# ───────────────────────── 命令 ─────────────────────────
+LS_COLS = ["role", "kind", "label", "loaded", "pid", "last_exit", "env", "log", "log_mtime"]
+
+
+def fmt_age(s):
+    if s is None:
+        return "-"
+    for unit, sec in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= sec:
+            return f"{s // sec}{unit}"
+    return f"{s}s"
+
+
+def cmd_ls(a):
+    entries = discover(include_cron=not a.no_cron)
+    if a.json:
+        emit_json({"ok": True, "repo": str(REPO), "count": len(entries), "bots": entries})
+    print(f"{'ROLE':<16}{'KIND':<6}{'LABEL':<40}{'LOAD':<6}{'PID':<8}{'EXIT':<6}{'ENV':<5}{'LOG AGE':<8}")
+    for e in entries:
+        print(f"{(e['role'] or '-'):<16}{e['kind']:<6}{(e['label'] or '(无 plist)'):<40}"
+              f"{'yes' if e['loaded'] else 'NO':<6}{str(e['pid'] or '-'):<8}"
+              f"{str(e['last_exit'] if e['last_exit'] is not None else '-'):<6}"
+              f"{'yes' if e['env'] else '-':<5}{fmt_age(e['log_age_s']):<8}")
+    bots = [e for e in entries if e["kind"] == "bot"]
+    eprint(f"\n共 {len(entries)} 项（bot {len(bots)}，运行中 {sum(1 for b in bots if b['running'])}）。"
+           f"日志目录 {REPO}；细节 `gw status <role>`，体检 `gw doctor`")
+
+
+def cmd_status(a):
+    entries = discover(deep=True)
+    e = find(entries, a.role)
+    if not e:
+        fail(f"找不到角色/label: {a.role}（gw ls 看全部）", a.json)
+    e = dict(e)
+    e["errors"] = error_summary(e, scan=a.lines)
+    if a.json:
+        emit_json({"ok": True, "bot": e})
+    for k in ["role", "kind", "label", "plist", "loaded", "pid", "last_exit", "runs", "uptime_s",
+              "env", "log", "log_mtime", "log_bytes", "stderr_log"]:
+        print(f"{k:<11}{e.get(k)}")
+    er = e["errors"]
+    print(f"\n最近 {er['scanned_lines']} 行日志里错误 {er['error_count']} 条：")
+    for l in er["recent_errors"]:
+        print("  " + l)
+    if er["stderr_log_tail"]:
+        print("\nlaunchd stderr 尾部：")
+        for l in er["stderr_log_tail"]:
+            print("  " + l)
+
+
+def cmd_logs(a):
+    e = find(discover(), a.role)
+    if not e:
+        fail(f"找不到角色/label: {a.role}", a.json)
+    if a.err:
+        lines = [l for l in tail_lines(e["log"], max(a.n * 20, 2000)) if is_err_line(l)][-a.n:]
+        src = e["log"] + " (仅错误行)"
+        if e.get("stderr_log"):
+            lines += [f"[stderr] {l}" for l in tail_lines(e["stderr_log"], a.n) if l.strip()]
+    else:
+        lines = tail_lines(e["log"], a.n)
+        src = e["log"]
+    if a.json:
+        emit_json({"ok": True, "role": e["role"], "source": src, "lines": lines})
+    eprint(f"== {src}")
+    print("\n".join(lines))
+
+
+def cmd_restart(a):
+    entries = discover(include_cron=False)
+    if a.all:
+        targets = [e for e in entries if e["kind"] == "bot" and e["label"]]
+    elif a.role:
+        e = find(entries, a.role)
+        if not e:
+            fail(f"找不到角色/label: {a.role}", a.json)
+        targets = [e]
+    else:
+        fail("需要 <role> 或 --all", a.json)
+    results, any_fail = [], False
+    for e in targets:
+        r = {"role": e["role"], "label": e["label"], "pid_before": e["pid"]}
+        if not e["label"]:
+            r.update(action="skip", reason="没有 plist（只有 .env），无法 kickstart")
+        elif not e["loaded"]:
+            r.update(action="skip", reason=f"plist 未加载；先 launchctl bootstrap gui/{UID} {e['plist']}")
+        else:
+            cmd = ["launchctl", "kickstart", "-k", f"gui/{UID}/{e['label']}"]
+            r["command"] = " ".join(cmd)
+            if a.dry_run:
+                r["action"] = "would_restart"
+            else:
+                rc, so, se = run(cmd)
+                r["action"] = "restarted" if rc == 0 else "failed"
+                r["rc"] = rc
+                if rc != 0:
+                    r["stderr"] = se.strip()
+                    any_fail = True
+        results.append(r)
+        if not a.json:
+            mark = {"restarted": "✅", "would_restart": "🔎", "failed": "❌", "skip": "⏭ "}[r["action"]]
+            eprint(f"{mark} {r['role']:<16} {r.get('label') or ''} {r.get('reason') or r.get('command') or ''}")
+    if not a.dry_run and a.wait and any(r["action"] == "restarted" for r in results):
+        time.sleep(a.wait)
+        ll = launchctl_list()
+        for r in results:
+            if r["action"] == "restarted":
+                r["pid_after"] = ll.get(r["label"], (None, None))[0]
+                if r["pid_after"] is None:
+                    any_fail = True
+                    r["action"] = "restarted_but_not_running"
+    out = {"ok": not any_fail, "dry_run": a.dry_run, "count": len(results), "results": results}
+    if a.json:
+        emit_json(out, 1 if any_fail else 0)
+    if a.dry_run:
+        eprint(f"(dry-run) 将重启 {sum(r['action'] == 'would_restart' for r in results)} 个，未执行任何操作")
+    sys.exit(1 if any_fail else 0)
+
+
+def env_active_ports(env_path):
+    hits = []
+    try:
+        for i, line in enumerate(open(env_path, encoding="utf-8", errors="replace"), 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            for port in RETIRED_PORTS:
+                if re.search(rf"[:=]{port}\b", s):
+                    hits.append({"line": i, "key": s.split("=", 1)[0], "port": port})
+    except OSError:
+        pass
+    return hits
+
+
+def cmd_doctor(a):
+    entries = discover(deep=True)
+    procs = role_processes()
+    findings = []
+
+    def add(level, code, role, msg, **kw):
+        findings.append({"level": level, "code": code, "role": role, "message": msg, **kw})
+
+    for e in entries:
+        r = e["role"]
+        if e["kind"] == "bot":
+            if e["env"] and not e["plist"]:
+                add("warn", "env_without_plist", r, f".env.{r} 存在但没有 launchd plist（未托管/已退役？）", env=e["env"])
+            if e["plist"] and not e["env"]:
+                add("error", "plist_without_env", r, f"plist 指向角色 {r} 但找不到对应 .env", plist=e["plist"])
+            if e["plist"] and not e["loaded"]:
+                add("error", "plist_not_loaded", r, "plist 存在但未加载到 launchd", plist=e["plist"])
+            if e["loaded"] and e["keepalive"] and not e["running"]:
+                add("error", "not_running", r, f"KeepAlive bot 已加载但没有进程（最近退出码 {e['last_exit']}）",
+                    label=e["label"])
+            runs, up = e.get("runs"), e.get("uptime_s")
+            if runs and runs >= 5 and (up is None or up < 300):
+                add("error", "flapping", r, f"launchd 已拉起 {runs} 次且当前进程仅活 {up}s，疑似反复崩溃",
+                    label=e["label"])
+            elif runs and runs >= 5:
+                add("info", "restarted_often", r, f"本次开机后 launchd 已拉起 {runs} 次（当前稳定 {fmt_age(up)}）")
+            if e["log_bytes"] and e["log_bytes"] > HUGE_LOG_BYTES:
+                add("warn", "huge_log", r, f"日志 {e['log_bytes'] // 1048576}MB，建议轮转", log=e["log"])
+            if e["running"] and e["log_age_s"] and e["log_age_s"] > STALE_LOG_S:
+                add("info", "stale_log", r, f"进程在跑但日志 {fmt_age(e['log_age_s'])} 未更新", log=e["log"])
+            pids = procs.get(r, [])
+            if len(pids) > 1:
+                add("warn", "duplicate_process", r, f"同角色有 {len(pids)} 个启动进程 {pids}，可能重复收消息")
+            if pids and not e["running"]:
+                add("warn", "unmanaged_process", r, f"有进程 {pids} 在跑但不归 launchd 管")
+        if e["kind"] == "cron" and e["loaded"] and e["last_exit"] not in (0, None):
+            add("warn", "cron_last_failed", r, f"定时任务 {e['label']} 上次退出码 {e['last_exit']}")
+        if e["env"]:
+            for h in env_active_ports(e["env"]):
+                add("error", "retired_port", r, f"{os.path.basename(e['env'])}:{h['line']} {h['key']} 仍指向已退役端口 {h['port']}")
+    # .env 角色没有用到但 launchd 里有 claude 相关 label 却没 plist 文件
+    plist_labels = {e["label"] for e in entries if e["label"]}
+    for label in launchctl_list():
+        if (label.startswith("com.claude.bot") or label.startswith("com.libin.claude-feishu")) and label not in plist_labels:
+            add("warn", "loaded_without_plist", None, f"{label} 在 launchd 里但 LaunchAgents 下没有对应 plist")
+    # 已退役脚本漂移：_restart_all.sh 仍写死 label 列表
+    ra = REPO / "_restart_all.sh"
+    if ra.exists() and "gw" not in ra.read_text(errors="replace"):
+        add("warn", "restart_script_drift", None, "_restart_all.sh 仍写死 label 列表，应改为 gw restart --all")
+
+    errs = sum(f["level"] == "error" for f in findings)
+    warns = sum(f["level"] == "warn" for f in findings)
+    bots = [e for e in entries if e["kind"] == "bot"]
+    summary = {"bots": len(bots), "running": sum(b["running"] for b in bots),
+               "crons": sum(e["kind"] == "cron" for e in entries), "errors": errs, "warnings": warns}
+    code = 2 if errs else 0
+    if a.json:
+        emit_json({"ok": True, "healthy": errs == 0, "summary": summary, "findings": findings}, code)
+    icon = {"error": "❌", "warn": "⚠️ ", "info": "ℹ️ "}
+    for f in sorted(findings, key=lambda x: ["error", "warn", "info"].index(x["level"])):
+        print(f"{icon[f['level']]} [{f['code']}] {f['role'] or '-'}: {f['message']}")
+    print(f"\nbot {summary['bots']} 个（运行 {summary['running']}），cron {summary['crons']} 个；"
+          f"error {errs} / warn {warns}")
+    sys.exit(code)
+
+
+CAPABILITIES = {
+    "name": "gw", "version": VERSION,
+    "description": "claude-gateway 飞书/企微 bot 运维：自动发现、状态、日志、重启、体检",
+    "conventions": {"json_flag": "--json", "stdout": "pure JSON when --json", "stderr": "human logs",
+                    "exit_codes": {"0": "ok", "1": "command failed (ok=false)", "2": "doctor found errors"}},
+    "commands": {
+        "ls": {"args": ["--json", "--no-cron"], "readonly": True},
+        "status": {"args": ["<role|label>", "--json", "--lines N"], "readonly": True},
+        "logs": {"args": ["<role|label>", "-n N", "--err", "--json"], "readonly": True},
+        "restart": {"args": ["<role|label> | --all", "--dry-run", "--wait SEC", "--json"], "readonly": False,
+                    "note": "launchctl kickstart -k；--all 只含 kind=bot 且有 plist 的项"},
+        "doctor": {"args": ["--json"], "readonly": True,
+                   "checks": ["env_without_plist", "plist_without_env", "plist_not_loaded", "not_running",
+                              "flapping", "huge_log", "stale_log", "duplicate_process", "unmanaged_process",
+                              "cron_last_failed", "retired_port", "loaded_without_plist", "restart_script_drift"]},
+        "capabilities": {"args": ["--json"], "readonly": True},
+    },
+    "env": {"GW_REPO": "覆盖仓库路径", "GW_LAUNCH_AGENTS": "覆盖 LaunchAgents 目录（测试用）"},
+}
+
+
+def cmd_capabilities(a):
+    if a.json:
+        emit_json({"ok": True, **CAPABILITIES})
+    print(json.dumps(CAPABILITIES, ensure_ascii=False, indent=2))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="gw", description="claude-gateway bot 运维（自动发现 .env + launchd）")
+    p.add_argument("--version", action="version", version=f"gw {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("ls", help="列出所有 bot / 定时任务")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--no-cron", action="store_true", help="不列 bot-cron 定时任务")
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("status", help="单个 bot 详情 + 近期错误摘要")
+    s.add_argument("role")
+    s.add_argument("--lines", type=int, default=400, help="扫描日志尾部行数（默认 400）")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("logs", help="看日志尾部")
+    s.add_argument("role")
+    s.add_argument("-n", type=int, default=50)
+    s.add_argument("--err", action="store_true", help="只看错误行（+ launchd stderr 文件）")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("restart", help="launchctl kickstart -k 重启")
+    s.add_argument("role", nargs="?")
+    s.add_argument("--all", action="store_true", help="重启自动发现的全部 bot")
+    s.add_argument("--dry-run", action="store_true", help="只打印将执行的命令")
+    s.add_argument("--wait", type=int, default=0, help="重启后等 N 秒复核进程是否起来")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_restart)
+
+    s = sub.add_parser("doctor", help="体检：漂移 / 未加载 / 崩溃 / 退役端口等")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("capabilities", help="自描述")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_capabilities)
+
+    a = p.parse_args()
+    try:
+        a.fn(a)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        fail(f"{type(e).__name__}: {e}", getattr(a, "json", False))
+
+
+if __name__ == "__main__":
+    main()
