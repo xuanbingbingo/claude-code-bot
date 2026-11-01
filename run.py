@@ -5,12 +5,14 @@
 平台(adapter)、智能体(backend)解耦:加平台只写 adapters/<p>/,加后端只写 backends/<b>.py。
 """
 import asyncio
+import hashlib
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.config import load_env, BotConfig            # noqa: E402
+from core.persona import load_bot_persona              # noqa: E402
 from core.runtime_rules import RUNTIME_RULES           # noqa: E402
 from core import memory as role_memory                 # noqa: E402
 from core.session_manager import SessionManager        # noqa: E402
@@ -38,20 +40,27 @@ def main():
     # RUNTIME_RULES 放最后:一次性进程/禁 run_in_background 是物理事实,不许被人设覆盖。
     # 角色 bot(BOT_ROLE / bots/<role>/persona.md):记忆纪律由网关统一生成进系统提示(内容不变,首轮生效即可),
     # 记忆内容每轮拼进用户消息(会变的东西不能放系统提示:--resume 只认首轮)。见 core/memory.py。
-    discipline = role_memory.discipline(config.role, where="飞书") if config.role else ""
     turn_prefix = (lambda prompt: role_memory.wrap_turn(config.role, prompt)) if config.role else None
     turn_log = (lambda u, a: role_memory.log_turn(config.role, "飞书", u, a)) if config.role else None
 
-    def backend_factory(is_group: bool = False):
+    def build_prompt(is_group: bool = False) -> str:
+        # 每次现读人设文件和 roles.json:人设改了不用重启,新会话 / 补发都拿到新版
+        persona = load_bot_persona() or config.persona
+        discipline = role_memory.discipline(config.role, where="飞书") if config.role else ""
         relay_prompt = relay.system_prompt() if is_group else ""
-        append_prompt = "\n\n".join(p for p in (config.persona, discipline, relay_prompt,
-                                                adapter.tool_prompt(), RUNTIME_RULES) if p)
-        return make_backend(config.backend, cwd=config.cwd, append_prompt=append_prompt, turn_prefix=turn_prefix, turn_log=turn_log)
+        return "\n\n".join(p for p in (persona, discipline, relay_prompt,
+                                        adapter.tool_prompt(), RUNTIME_RULES) if p)
+
+    def backend_factory(is_group: bool = False):
+        return make_backend(config.backend, cwd=config.cwd, append_prompt=build_prompt(is_group),
+                            turn_prefix=turn_prefix, turn_log=turn_log)
 
     # state_key 按平台取 bot 唯一标识(飞书 app_id / 企微 bot_id / TG botid),用于跨重启会话续接落盘
-    # stamp_fn:人设文件变了 → 该会话下一条消息自动开新会话(续接会话吃不到新人设)
+    # stamp_fn:按本 bot 系统提示的「内容」算指纹——别的角色改 roles.json、改了代码注释都不算变;
+    # 真变了也不开新会话,保留上下文、下一条消息补发新人设(11-01 用户定)
     sessions = SessionManager(backend_factory, state_key=adapter.state_key(),
-                              stamp_fn=lambda: role_memory.persona_stamp(config.persona_files))
+                              stamp_fn=lambda: hashlib.sha1(build_prompt(False).encode()).hexdigest(),
+                              prompt_fn=build_prompt)
 
     # 语音回复:仅支持的平台(目前飞书)且未显式关掉时才装;会话级开关按 bot 隔离落盘
     voice = None
@@ -64,7 +73,7 @@ def main():
     if config.persona:
         print(f"   🎭 人设 {len(config.persona)} 字")
     if config.role:
-        print(f"   🧠 角色记忆 bots/{config.role}/(纪律 {len(discipline)} 字,记忆每轮注入)")
+        print(f"   🧠 角色记忆 bots/{config.role}/(纪律 {len(role_memory.discipline(config.role))} 字,记忆每轮注入)")
     if sessions.loaded_count():
         print(f"   🔖 已加载 {sessions.loaded_count()} 条会话指针(重启自动续接)")
     if voice:

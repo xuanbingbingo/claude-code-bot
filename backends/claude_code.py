@@ -16,13 +16,25 @@ class ClaudeCodeBackend(AgentBackend):
         # --resume 只认首轮的 --append-system-prompt,之后传的全被忽略(10-24 实测)。
         self._turn_prefix = turn_prefix
         self._turn_log = turn_log            # (user_text, assistant_text) -> None,跨渠道对话摘要
+        self._pending_prompt = ""            # 人设中途变了:下一条消息补发一次(见 update_system_prompt)
         if append_prompt:
             self.session.extra_append_prompt = append_prompt
         if base_env:
             self.session.extra_env.update(base_env)
 
     # ---- 执行 ----
+    def update_system_prompt(self, text: str) -> None:
+        """人设中途改了:新开的会话直接用新系统提示;正在续接的会话(--resume 吃不到新系统提示)
+        在下一条用户消息前补一次,会话和上下文都保留。"""
+        self.session.extra_append_prompt = text
+        self._pending_prompt = text if self.session.current_session_id else ""
+
     def _wrap(self, prompt: str) -> str:
+        if self._pending_prompt:
+            note, self._pending_prompt = self._pending_prompt, ""
+            prompt = ("[系统设定已更新 · 开始]\n老板改了你的人设/规矩，从这一轮起按下面的新版执行，"
+                      "之前的对话照常延续。老板看不到这段，别复述。\n\n"
+                      f"{note}\n[系统设定已更新 · 结束]\n\n{prompt}")
         if not self._turn_prefix:
             return prompt
         try:

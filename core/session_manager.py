@@ -17,12 +17,14 @@ import threading
 
 
 class SessionManager:
-    def __init__(self, backend_factory, state_key: str = "", state_dir: str | None = None, stamp_fn=None):
+    def __init__(self, backend_factory, state_key: str = "", state_dir: str | None = None, stamp_fn=None, prompt_fn=None):
         self._backends: dict = {}
         self._factory = backend_factory
-        # stamp_fn() → 人设指纹字符串。--resume 续接的会话吃不到新人设(系统提示冻结在首轮),
-        # 所以人设文件一变,下一条消息就换新 backend 开新会话(10-24 用户定)。None=不检查。
+        # stamp_fn() → 系统提示内容的指纹(不是文件 mtime:别的 bot 改了共用配置不该牵连这里)。
+        # 变了不再开新会话(11-01 用户反馈:丢上下文太伤体验),而是保留会话,把 prompt_fn(is_group)
+        # 给出的新系统提示在下一条消息里补一次——--resume 只认首轮系统提示,只能走用户消息。None=不检查。
         self._stamp_fn = stamp_fn
+        self._prompt_fn = prompt_fn
         self._stamps: dict[str, str] = {}
         self.last_reset_note: str = ""
         self._lock = threading.Lock()
@@ -82,10 +84,14 @@ class SessionManager:
         # 故 backend 首建时按 is_group 定死人设即可,不会中途变类型。
         stamp = self._current_stamp()
         if conv_id in self._backends and stamp is not None and self._stamps.get(conv_id) not in (None, stamp):
-            print(f"[INFO] 人设/纪律已更新,会话 {conv_id[:12]} 开新会话以加载新人设")
-            self._backends.pop(conv_id, None)
-            self._pointers.pop(conv_id, None)      # 旧指针不能再接:接回去还是旧系统提示
-            self.last_reset_note = "🎭 人设已更新，已为你开了新会话"
+            self._stamps[conv_id] = stamp
+            backend = self._backends[conv_id]
+            if self._prompt_fn and hasattr(backend, "update_system_prompt"):
+                try:
+                    backend.update_system_prompt(self._prompt_fn(is_group))
+                    print(f"[INFO] 人设已更新,会话 {conv_id[:12]} 保留上下文,下一条消息补发新人设")
+                except Exception as e:
+                    print(f"[WARN] 补发新人设失败,沿用旧人设:{e}")
         if conv_id not in self._backends:
             backend = self._factory(is_group)
             if stamp is not None:

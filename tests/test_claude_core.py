@@ -389,3 +389,16 @@ class TestRetryOnStall:
         s.current_session_id = "missing"
         out = asyncio.run(s._retry_on_stall(cc._RunOutcome(stalled=True), None))
         assert out.stall_retries == 0
+
+
+def test_backend_update_system_prompt_injects_once():
+    """续接中的会话改了人设:新系统提示只在下一条消息前补一次;新会话直接走 --append-system-prompt。"""
+    from backends.claude_code import ClaudeCodeBackend
+    b = ClaudeCodeBackend(append_prompt="旧人设")
+    b.update_system_prompt("新人设")                 # 还没会话:不补发,只换系统提示
+    assert b.session.extra_append_prompt == "新人设" and b._wrap("你好") == "你好"
+    b.set_resume_session("sid-a")
+    b.update_system_prompt("新人设2")
+    first = b._wrap("你好")
+    assert "新人设2" in first and first.endswith("你好")
+    assert b._wrap("再问") == "再问"

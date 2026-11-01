@@ -512,7 +512,7 @@ bash scripts/new-agent.sh researcher cli_xxx secret_yyy ~/.claude/agents/researc
 
 1. **记忆内容每轮拼进用户消息，不放 `--append-system-prompt`。** 实测 `claude -p --resume` 只认会话首轮的系统提示，之后传的全被忽略；续接会话里模型也不会再去 Read 文件。`ClaudeCodeBackend(turn_prefix=…)` 每轮把 `memory.wrap_turn(role, prompt)` 拼在前面，日志里只打印用户原话。
 2. **纪律由网关生成，persona.md 只写身份。** 「读 / 写 / 文件结构 / 发文件 / 个人记忆库」五节纪律是 `memory.discipline(role, where)`，按 roles.json 的 `remember` / `extra` 填参数；运转台（ceo-agent）调同一个函数。改纪律改一处，17 个角色一起生效。
-3. **人设文件变了自动开新会话。** `SessionManager(stamp_fn=…)` 每条消息比对人设文件 + roles.json 的 mtime 指纹，变了就换新 backend、作废旧会话指针，并提示用户「人设已更新，已开新会话」。
+3. **人设变了不开新会话，保留上下文补发新人设。** 每次建会话都现读人设文件和 roles.json 拼系统提示；`SessionManager(stamp_fn=…, prompt_fn=…)` 每条消息按本 bot 系统提示的**内容**算指纹（别的角色改 roles.json、改代码注释都不算变）。真变了：同一会话继续，新系统提示在下一条用户消息前补一次（`--resume` 吃不到新的 `--append-system-prompt`），之后新开的会话直接用新版。（11-01 起；之前是按文件 mtime 一变就开新会话，新建一个 bot 改了 roles.json 会把所有 bot 的会话都清掉。）
 
 **记忆衰减**：`bots/memory_tidy.py` 每晚由 ceo-agent `nightly` 调用——流水里早于 `keep_days`（45）的归档到 `bots/<role>/archive/YYYY-MM.md`（只增不删），归档的条目分块喂 sonnet，只让它输出「长期事实里还没有的」新条目追加进去，不改写已有事实。`--dry` 只报告，`--migrate` 只转格式。
 

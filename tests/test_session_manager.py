@@ -126,22 +126,30 @@ def test_gateway_persists_pointer_even_on_exception(tmp_path):
     assert data == {"conv1": "sid-from-crashed-run"}
 
 
-def test_persona_stamp_change_opens_new_session(tmp_path):
-    """人设文件变了 → 同一 conv 下一次 get_or_create 换新 backend(新会话),旧指针作废。"""
+def test_persona_change_keeps_session_and_queues_prompt(tmp_path):
+    """人设内容变了 → 不换 backend、不丢会话指针,只把新系统提示交给 backend 补发;不给用户发「开新会话」提示。"""
     state = tmp_path / ".sessions-k.json"
     state.write_text(json.dumps({"conv1": "sid-a"}))
     stamp = {"v": "s1"}
+    prompt = {"v": "人设v1"}
 
-    def factory(is_group=False):
-        b = FakeBackend()
-        b._files = {"sid-a"}
-        return b
+    class PromptBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self._files = {"sid-a"}
+            self.updates = []
 
-    sm = SessionManager(factory, state_key="k", state_dir=str(tmp_path), stamp_fn=lambda: stamp["v"])
+        def update_system_prompt(self, text):
+            self.updates.append(text)
+
+    sm = SessionManager(lambda is_group=False: PromptBackend(), state_key="k", state_dir=str(tmp_path),
+                        stamp_fn=lambda: stamp["v"], prompt_fn=lambda is_group=False: prompt["v"])
     b1 = sm.get_or_create("conv1")
     assert b1.resumed_with == "sid-a"
-    assert sm.get_or_create("conv1") is b1          # 没变:同一个
-    stamp["v"] = "s2"
-    b2 = sm.get_or_create("conv1")
-    assert b2 is not b1 and b2.resumed_with is None  # 变了:新 backend,且不再 resume 旧会话
-    assert sm.pop_reset_note() and sm.pop_reset_note() == ""
+    assert sm.get_or_create("conv1") is b1 and b1.updates == []   # 没变:不补发
+    stamp["v"], prompt["v"] = "s2", "人设v2"
+    assert sm.get_or_create("conv1") is b1                          # 变了:还是同一个会话
+    assert b1.updates == ["人设v2"]
+    assert sm.get_or_create("conv1") is b1 and b1.updates == ["人设v2"]  # 只补一次
+    assert sm.pop_reset_note() == ""
+    assert sm._pointers == {"conv1": "sid-a"}
