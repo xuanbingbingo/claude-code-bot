@@ -90,7 +90,7 @@ def run_registration(platform: str = "feishu", timeout: int = 600, role: str = "
     base = LARK_BASE if platform == "lark" else FEISHU_BASE
     tag = f"[{role}] " if role else ""
 
-    with httpx.Client() as client:
+    with httpx.Client(trust_env=False) as client:  # 飞书国内直连，不走会话继承的代理（代理会 SSL EOF）
         # ---------- 1. init：探测是否支持 client_secret 认证 ----------
         eprint(f"{tag}① 探测注册端点 ...")
         init_res = _call(client, base, "init", {})
@@ -136,7 +136,13 @@ def run_registration(platform: str = "feishu", timeout: int = 600, role: str = "
 
         # ---------- 3. poll：轮询直到用户扫码授权 ----------
         while time.time() < deadline:
-            poll_res = _call(client, base, "poll", {"device_code": device_code})
+            try:
+                poll_res = _call(client, base, "poll", {"device_code": device_code})
+            except httpx.TransportError as e:
+                # 网络抖动（SSL EOF / 断连）不放弃：用户可能已经扫码，丢掉这次就拿不回凭证
+                eprint(f"{tag}   轮询网络错误，{interval}s 后重试：{e}")
+                time.sleep(interval)
+                continue
 
             # 国内/国际版切换：扫码人属 lark 租户则切端点继续轮询
             brand = (poll_res.get("user_info") or {}).get("tenant_brand", "").lower()
