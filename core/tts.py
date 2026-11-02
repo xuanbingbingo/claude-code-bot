@@ -245,8 +245,10 @@ class VoiceService:
         self._save()
 
     def voice_for(self, conv_id: str) -> str:
-        """会话级音色 > 本 bot 的 BOT_VOICE_NAME > hfvoice 默认(空串)。"""
-        return self._entry(conv_id).get("voice") or self.voice_name
+        """会话级音色 > 本 bot 的 BOT_VOICE_NAME > 清爽男声。
+        2026-10-29 起 hfvoice 默认改成本机 Breeze 克隆(出片用,比实时还慢),聊天语音回复等不起,
+        不能再落到 hfvoice 默认;清爽男声=剪映免费接口,不受云端付费闸门限制。"""
+        return self._entry(conv_id).get("voice") or self.voice_name or "清爽男声"
 
     def set_voice(self, conv_id: str, name: str):
         e = self._entry(conv_id)
