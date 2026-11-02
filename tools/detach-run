@@ -64,6 +64,10 @@ def main() -> None:
 
     # 单个字符串且带 shell 元字符 → 交给 shell 跑（允许管道/重定向/&&）
     shell = len(cmd) == 1 and any(c in cmd[0] for c in "|&;<>$`(){}*?")
+    env = os.environ.copy()
+    # 甩到后台的多半是 `claude -p` 跑团队剧本：-p 默认最多等后台 Agent 600 秒就自杀，
+    # 2026-11-03 小程序团队因此在 Phase 2 被腰斩。脱离运行的任务本来就不赶时间，一律无限等。
+    env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
     with open(log, "ab", buffering=0) as f:
         f.write(f"$ {' '.join(cmd)}\n[detach-run] started {time.strftime('%F %T')}\n".encode())
         proc = subprocess.Popen(
@@ -74,7 +78,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             start_new_session=True,      # ← 核心：脱离父进程的会话与进程组
             cwd=os.getcwd(),
-            env=os.environ.copy(),
+            env=env,
         )
 
     print("✅ 已脱离后台运行")
