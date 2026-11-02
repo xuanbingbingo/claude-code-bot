@@ -28,6 +28,11 @@ source "$ENV_FILE"
 export BOT_PLATFORM="${BOT_PLATFORM:-feishu}"      # 默认飞书;.env 可覆盖
 set +a
 
+# 飞书/企微/钉钉是国内域名,一律直连:macOS 系统代理指向 17891(0dcloud),它没开时
+# 飞书 SDK 读到系统代理会连不上,所有 bot 掉线(2026-11-03 踩过)
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,.feishu.cn,.feishu.net,.larksuite.com,.larkoffice.com,.qq.com,.weixin.qq.com,.dingtalk.com"
+export no_proxy="$NO_PROXY"
+
 # 优先用仓库内 venv，没有则回退系统 python3
 export PYTHONUNBUFFERED=1
 PYTHON="$SCRIPT_DIR/venv/bin/python"
