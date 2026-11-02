@@ -11,6 +11,8 @@
 
 角色参数在 ~/aiProjects/bots/_shared/roles.json；写记忆走 ~/aiProjects/bots/memo.py。
 """
+import contextlib
+import fcntl
 import importlib.util
 import json
 import os
@@ -179,16 +181,29 @@ def log_turn(role, channel, user_text, assistant_text, limit_user=240, limit_ass
            "u": _squash(user_text, limit_user), "a": _squash(assistant_text, limit_assistant)}
     p = chatlog_path(role)
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    try:
-        lines = open(p, encoding="utf-8").read().splitlines() if os.path.exists(p) else []
-    except OSError:
-        lines = []
-    lines.append(json.dumps(rec, ensure_ascii=False))
-    lines = lines[-CHATLOG_KEEP:]
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(tmp, p)
+    # 飞书 / 运转台 / 定时任务可能同时记同一角色：读-改-写全程持锁，临时文件名带 pid，否则后写的会覆盖先写的那一轮
+    with _file_lock(p):
+        try:
+            lines = open(p, encoding="utf-8").read().splitlines() if os.path.exists(p) else []
+        except OSError:
+            lines = []
+        lines.append(json.dumps(rec, ensure_ascii=False))
+        lines = lines[-CHATLOG_KEEP:]
+        tmp = f"{p}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, p)
+
+
+@contextlib.contextmanager
+def _file_lock(path):
+    """对 path 加独占锁（锁文件 path.lock，和 bots/memo.py 同一约定），进程退出自动释放。"""
+    with open(path + ".lock", "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _squash(text, limit):

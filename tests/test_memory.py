@@ -131,3 +131,26 @@ def test_backend_logs_turn_after_run(monkeypatch):
     monkeypatch.setattr(b.session, "run_claude", fake_run)
     asyncio.run(b.run("原话", None))
     assert logged == [("原话", "回答")]
+
+
+def _log_many(bots_dir, role, channel, n):
+    import core.memory as M
+    M.BOTS = bots_dir
+    for i in range(n):
+        M.log_turn(role, channel, f"{channel}-{i}", "ok")
+
+
+def test_log_turn_concurrent_writers_lose_nothing(tmp_path, monkeypatch):
+    """多个渠道（进程）同时记同一角色，一轮都不能丢（issue #1）。"""
+    import multiprocessing as mp
+    M, bots = _setup_bots(tmp_path, monkeypatch)
+    ctx = mp.get_context("fork")
+    procs = [ctx.Process(target=_log_many, args=(str(bots), "r1", f"ch{k}", 30)) for k in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    lines = (bots / "r1" / "chatlog.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 120
+    assert len({json.loads(x)["u"] for x in lines}) == 120
+    assert not list((bots / "r1").glob("*.tmp"))
